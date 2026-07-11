@@ -1,15 +1,29 @@
-# bilibili-skipper
-B站自动跳片头片尾脚本
+# B站播放器增强工具箱
 
-现在是 v2.1，支持普通页面和新版 Web Components 播放器。
+一个集中改善 Bilibili 网页播放器观看体验的用户脚本。当前版本为 v3.1.0，支持普通视频、番剧、合集页面和新版 Web Components 播放器。
 
-功能：
-1. 按 `Shift + M` 设置片头时间和片尾时长，支持 `mm:ss`、秒数和中文冒号 `：`。
-2. 按 `O` 键开启/关闭自动跳转，会记住上一次设置和开关状态。
-3. 支持 `video`、`bangumi/play`、`list` 页面。
-4. 兼容 Shadow DOM 播放器、原生全屏提示浮层、SPA 切换后的播放器重建。
+## 功能
 
-安装方式：
+1. **自动跳片头片尾**：按 `Shift + M` 设置片头时间和片尾时长，支持 `mm:ss`、秒数和中文冒号 `：`。
+2. **快速开关跳过功能**：按 `O` 开启或关闭自动跳转，并记住上一次设置和开关状态。
+3. **快捷切换中文字幕**：按 `C` 开启中文字幕；再次按下可关闭当前中文字幕。脚本会记住字幕状态，并在刷新或播放器重建后自动恢复。输入文字时不会误触。
+4. **选集显示 P 序号**：在播放器选集列表中自动为各分 P 添加 `P1`、`P2` 等序号。
+5. **字幕快捷键提示**：播放器字幕按钮会显示 `字幕 (c)`，方便记忆快捷键。
+6. **字幕画中画**：检测到画中画模式菜单时，优先选择支持字幕的“新版画中画”。
+7. **广泛兼容**：支持 `video`、`bangumi/play`、`list` 页面，兼容 Shadow DOM、原生全屏浮层及 SPA 切换后的播放器重建。
+
+## 安装
+
 1. 前提：已安装 Tampermonkey、Violentmonkey 或其他支持用户脚本的扩展。
-2. 方法一：点击链接直接安装：https://raw.githubusercontent.com/mankaki/bilibili-skipper/main/bili_skipper.user.js
+2. 方法一：点击链接直接安装：https://raw.githubusercontent.com/mankaki/bilibili-player-toolkit/main/bilibili-player-toolkit.user.js
 3. 方法二：通过 Greasy Fork 安装：https://greasyfork.org/zh-CN/scripts/539778-b%E7%AB%99%E8%87%AA%E5%8A%A8%E8%B7%B3%E7%89%87%E5%A4%B4%E7%89%87%E5%B0%BE
+
+旧版 `bili_skipper.user.js` 安装地址会继续提供兼容入口，并自动加载新版脚本。
+
+## 快捷键
+
+| 快捷键 | 功能 |
+| --- | --- |
+| `Shift + M` | 设置片头时间和片尾时长 |
+| `O` | 开启/关闭自动跳片头片尾 |
+| `C` | 开启/关闭中文字幕 |
