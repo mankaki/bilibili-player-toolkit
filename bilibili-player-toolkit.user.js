@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站播放器增强工具箱
 // @namespace    https://www.bilibili.com/
-// @version      3.1.0
+// @version      3.1.9
 // @description  自动跳片头片尾、选集显示 P 序号、C 键切换中文字幕，并优先使用新版画中画
 // @author       mankaki (modified)
 // @match        *://www.bilibili.com/video/*
@@ -16,6 +16,7 @@
 (function () {
   'use strict';
 
+  const TOOLKIT_VERSION = '3.1.9';
   const KEY_HEAD = 'bili_skip_head';
   const KEY_TAIL = 'bili_skip_tail';
   const KEY_ENABLED = 'bili_skip_enabled';
@@ -30,9 +31,18 @@
     '.bpx-player-ctrl-subtitle-title',
     '.bpx-player-ctrl-subtitle-language-item',
     '.bpx-player-ctrl-subtitle-close-switch',
-    '.bpx-player-ctrl-pip-menu-item'
+    '.bpx-player-ctrl-pip-menu-item',
+    '.bpx-player-ctrl-eplist-episodes-content',
+    '.bpx-player-ctrl-eplist-multi-menu-item',
+    '.video-pod__body',
+    '.simple-base-item.page-item'
   ].join(', ');
   let enhancementUpdateFrame = null;
+  let playlistPositionRetryTimers = [];
+  let lastPlaylistPositionKey = null;
+  let nextPlaylistElementId = 1;
+  const playlistElementIds = new WeakMap();
+  const observedPlaylistRoots = new WeakSet();
 
   const playerEnhancementCss = `
     /* 选集列表从 P1 开始计数 */
@@ -52,6 +62,7 @@
   `;
 
   const style = document.createElement('style');
+  style.dataset.bilibiliPlayerToolkitVersion = TOOLKIT_VERSION;
   style.textContent = playerEnhancementCss;
 
   function injectPlayerEnhancementStyle() {
@@ -89,10 +100,110 @@
     }
   }
 
+  const CURRENT_PLAYLIST_ITEM_SELECTOR = [
+    '.bpx-player-ctrl-eplist-multi-menu-item.bpx-state-multi-active-item',
+    '.bpx-player-ctrl-eplist-multi-menu-item.bpx-state-active',
+    '.bpx-player-ctrl-eplist-multi-menu-item-active',
+    '.bpx-player-ctrl-eplist-multi-menu-item[aria-current="true"]'
+  ].join(', ');
+  const CURRENT_RIGHT_PLAYLIST_ITEM_SELECTOR = '.video-pod__body .simple-base-item.page-item.active';
+
+  function ensurePlaylistItemVisible(currentItem) {
+    const scrollContainer = currentItem.closest('.bpx-player-ctrl-eplist-section-bottom');
+    if (!scrollContainer || scrollContainer.clientHeight <= 0) return;
+
+    currentItem.dataset.biliToolkitPositionChecked = TOOLKIT_VERSION;
+    const itemRect = currentItem.getBoundingClientRect();
+    const containerRect = scrollContainer.getBoundingClientRect();
+    const isVisible = itemRect.top >= containerRect.top
+      && itemRect.bottom <= containerRect.bottom;
+    if (isVisible) return;
+
+    const targetScrollTop = scrollContainer.scrollTop
+      + itemRect.top - containerRect.top
+      - (scrollContainer.clientHeight - itemRect.height) / 2;
+    const maxScrollTop = scrollContainer.scrollHeight - scrollContainer.clientHeight;
+    scrollContainer.scrollTop = Math.max(0, Math.min(targetScrollTop, maxScrollTop));
+    scrollContainer.dataset.biliToolkitPositioned = TOOLKIT_VERSION;
+  }
+
+  function ensureRightPlaylistItemVisible(currentItem) {
+    const scrollContainer = currentItem.closest('.video-pod__body');
+    if (!scrollContainer || scrollContainer.clientHeight <= 0) return;
+
+    currentItem.dataset.biliToolkitPositionChecked = TOOLKIT_VERSION;
+    const itemRect = currentItem.getBoundingClientRect();
+    const containerRect = scrollContainer.getBoundingClientRect();
+    const isVisible = itemRect.top >= containerRect.top
+      && itemRect.bottom <= containerRect.bottom;
+    if (isVisible) return;
+
+    const targetScrollTop = scrollContainer.scrollTop
+      + itemRect.top - containerRect.top
+      - (scrollContainer.clientHeight - itemRect.height) / 2;
+    const maxScrollTop = scrollContainer.scrollHeight - scrollContainer.clientHeight;
+
+    // 只滚动右侧合集容器；instant 可绕过其 CSS smooth，且不会带动整个页面。
+    scrollContainer.scrollTo({
+      top: Math.max(0, Math.min(targetScrollTop, maxScrollTop)),
+      behavior: 'instant'
+    });
+    scrollContainer.dataset.biliToolkitPositioned = TOOLKIT_VERSION;
+  }
+
+  function positionPlaylistAtCurrentItem() {
+    document.querySelectorAll(CURRENT_PLAYLIST_ITEM_SELECTOR)
+      .forEach(ensurePlaylistItemVisible);
+    document.querySelectorAll(CURRENT_RIGHT_PLAYLIST_ITEM_SELECTOR)
+      .forEach(ensureRightPlaylistItemVisible);
+  }
+
+  function getPlaylistPositionKey() {
+    const currentItems = Array.from(document.querySelectorAll([
+      CURRENT_PLAYLIST_ITEM_SELECTOR,
+      CURRENT_RIGHT_PLAYLIST_ITEM_SELECTOR
+    ].join(', ')));
+
+    const getElementId = (element) => {
+      if (!element) return 0;
+      if (!playlistElementIds.has(element)) {
+        playlistElementIds.set(element, nextPlaylistElementId++);
+      }
+      return playlistElementIds.get(element);
+    };
+
+    return [location.href, ...currentItems.map((item) => {
+      const root = item.closest(
+        '.bpx-player-ctrl-eplist-section-bottom, .video-pod__body'
+      );
+      const semanticId = item.getAttribute('data-cid') || item.textContent?.trim() || '';
+      return `${getElementId(root)}:${getElementId(item)}:${semanticId}`;
+    })].join('|');
+  }
+
+  function cancelPlaylistPositionRetries() {
+    playlistPositionRetryTimers.forEach(clearTimeout);
+    playlistPositionRetryTimers = [];
+  }
+
+  function startPlaylistPositionRetries(force = false) {
+    const positionKey = getPlaylistPositionKey();
+    if (!force && positionKey === lastPlaylistPositionKey) return;
+
+    cancelPlaylistPositionRetries();
+    lastPlaylistPositionKey = positionKey;
+
+    // B站可能在播放器渲染数秒后再次把合集列表重置到顶部。
+    [0, 100, 250, 500, 1000, 2000, 4000, 7000, 10000].forEach((delay) => {
+      playlistPositionRetryTimers.push(setTimeout(positionPlaylistAtCurrentItem, delay));
+    });
+  }
+
   function updatePlayerEnhancements() {
     updateNativeSubtitleTip();
     preferSubtitlePictureInPicture();
     restoreChineseSubtitlePreference();
+    positionPlaylistAtCurrentItem();
   }
 
   function mayContainPlayerEnhancement(node) {
@@ -331,6 +442,7 @@
     if (element.tagName === 'VIDEO') {
       bindVideo(element);
     }
+    observePlaylistRoot(element);
     if (element.shadowRoot) {
       observeShadowHost(element);
     }
@@ -348,6 +460,38 @@
   }
 
   const shadowHostObservers = new Map();
+
+  function observePlaylistRoot(element) {
+    if (!element.matches(
+      '.bpx-player-ctrl-eplist-section-bottom, .video-pod__body'
+    ) || observedPlaylistRoots.has(element)) return;
+
+    const observer = new MutationObserver((mutations) => {
+      const currentItemChanged = mutations.some((mutation) => (
+        mutation.type === 'attributes'
+        && mutation.target instanceof Element
+        && mutation.target.matches(
+          '.bpx-player-ctrl-eplist-multi-menu-item, .simple-base-item.page-item'
+        )
+      ));
+      if (!currentItemChanged) return;
+
+      schedulePlayerEnhancementUpdate();
+      startPlaylistPositionRetries();
+    });
+    observer.observe(element, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'aria-current']
+    });
+    const cancelOnUserInteraction = (event) => {
+      if (event.isTrusted) cancelPlaylistPositionRetries();
+    };
+    element.addEventListener('wheel', cancelOnUserInteraction, { passive: true });
+    element.addEventListener('touchstart', cancelOnUserInteraction, { passive: true });
+    element.addEventListener('pointerdown', cancelOnUserInteraction);
+    observedPlaylistRoots.add(element);
+  }
 
   function disconnectShadowHost(host) {
     const entry = shadowHostObservers.get(host);
@@ -424,16 +568,21 @@
     scanAddedNodes(addedNodes);
     if (addedNodes.some(mayContainPlayerEnhancement)) {
       schedulePlayerEnhancementUpdate();
+      startPlaylistPositionRetries();
     }
   });
 
   function startObservers() {
     scanSubtree(document);
     updatePlayerEnhancements();
+    startPlaylistPositionRetries(true);
     if (document.documentElement) {
       documentObserver.observe(document.documentElement, { childList: true, subtree: true });
     }
   }
+
+  window.addEventListener('load', positionPlaylistAtCurrentItem);
+  window.addEventListener('pageshow', positionPlaylistAtCurrentItem);
 
   if (document.documentElement) {
     startObservers();
