@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站播放器增强工具箱
 // @namespace    https://www.bilibili.com/
-// @version      3.1.9
-// @description  自动跳片头片尾、选集显示 P 序号、C 键切换中文字幕，并优先使用新版画中画
+// @version      3.1.10
+// @description  自动跳片头片尾、选集显示 P 序号、C 键切换中文字幕、D 键切换弹幕开关，并优先使用新版画中画
 // @author       mankaki (modified)
 // @match        *://www.bilibili.com/video/*
 // @match        *://www.bilibili.com/bangumi/play/*
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const TOOLKIT_VERSION = '3.1.9';
+  const TOOLKIT_VERSION = '3.1.10';
   const KEY_HEAD = 'bili_skip_head';
   const KEY_TAIL = 'bili_skip_tail';
   const KEY_ENABLED = 'bili_skip_enabled';
@@ -590,6 +590,29 @@
     document.addEventListener('DOMContentLoaded', startObservers, { once: true });
   }
 
+  function findDanmakuSwitch() {
+    const roots = [document];
+    shadowHostObservers.forEach(({ host }) => {
+      if (host.isConnected && host.shadowRoot) roots.push(host.shadowRoot);
+    });
+    for (const root of roots) {
+      for (const control of root.querySelectorAll('.bpx-player-dm-switch')) {
+        const input = control.querySelector('input[type="checkbox"]');
+        if (input && !input.disabled && control.getClientRects().length) return control;
+      }
+    }
+    return null;
+  }
+
+  function toggleDanmaku(control) {
+    const input = control.querySelector('input[type="checkbox"]');
+    input.click();
+    // 新版原生循环为开启 → 精简 → 关闭；旧版两档开关无需额外点击。
+    if (input.getAttribute('aria-checked') === 'mixed') {
+      input.click();
+    }
+  }
+
   document.addEventListener('keydown', e => {
     // 穿透 B站 新版 Web Components(Shadow DOM) 获取真实的输入焦点
     let el = document.activeElement;
@@ -597,10 +620,20 @@
       el = el.shadowRoot.activeElement;
     }
     if (el && (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable)) return;
-    if (e.repeat) return;
+    if (e.isComposing) return;
 
     // 获取修饰键状态，防止误杀系统/浏览器级快捷键（比如 Ctrl+O 开文件、Cmd+M 窗口最小化）
     const hasModifier = e.ctrlKey || e.metaKey || e.altKey;
+
+    if (e.code === 'KeyD' && !e.shiftKey && !hasModifier) {
+      const control = findDanmakuSwitch();
+      if (!control) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (!e.repeat) toggleDanmaku(control);
+      return;
+    }
+    if (e.repeat) return;
 
     if (e.key.toLowerCase() === 'm' && e.shiftKey && !hasModifier) {
       e.preventDefault();
