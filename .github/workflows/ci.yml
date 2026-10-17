@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Syntax check
+        run: |
+          for f in *.user.js; do
+            echo "checking $f"
+            node --check "$f"
+          done
+
+      - name: Versions in sync
+        run: |
+          main=$(grep -m1 '@version' bilibili-player-toolkit.user.js | awk '{print $NF}')
+          shim=$(grep -m1 '@version' bili_skipper.user.js | awk '{print $NF}')
+          req=$(grep -m1 '@require.*bilibili-player-toolkit.user.js' bili_skipper.user.js | sed -n 's/.*?v=\([0-9.]*\).*/\1/p')
+          echo "main=$main shim=$shim require=$req"
+          [ "$main" = "$shim" ] && [ "$main" = "$req" ] \
+            || { echo "::error::三处版本号不一致（主脚本 @version、bili_skipper @version、@require ?v=）"; exit 1; }
+
+      - name: Version bumped (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          f=bilibili-player-toolkit.user.js
+          base="origin/${{ github.base_ref }}"
+          if git diff --quiet "$base" -- "$f"; then
+            echo "script unchanged, skip"; exit 0
+          fi
+          old=$(git show "$base:$f" | grep -m1 '@version' | awk '{print $NF}')
+          new=$(grep -m1 '@version' "$f" | awk '{print $NF}')
+          echo "old=$old new=$new"
+          [ "$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -1)" = "$new" ] && [ "$old" != "$new" ] \
+            || { echo "::error::脚本改了但 @version 没调高"; exit 1; }
+
+      - name: Tests
+        run: node --test tests/*.test.*
