@@ -24,6 +24,9 @@ jobs:
             node --check "$f"
           done
 
+      - name: Lint
+        run: npx --yes eslint@10 .
+
       - name: Versions in sync
         run: |
           main=$(grep -m1 '@version' bilibili-player-toolkit.user.js | awk '{print $NF}')
