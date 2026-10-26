@@ -23,14 +23,18 @@ test('controls added later to a shadow root schedule the default-state update', 
   let scheduled = 0;
   let retries = 0;
   let defaultRetries = 0;
+  let observedOptions;
   class FakeElement {
     matches() { return true; }
     querySelector() { return null; }
     closest() { return this; }
   }
+  class FakeText {
+    constructor(parentElement) { this.parentElement = parentElement; }
+  }
   class FakeMutationObserver {
     constructor(callback) { mutationCallback = callback; }
-    observe() {}
+    observe(_root, options) { observedOptions = options; }
   }
   const host = {
     shadowRoot: {
@@ -44,6 +48,7 @@ test('controls added later to a shadow root schedule the default-state update', 
     MutationObserver: FakeMutationObserver,
     PLAYER_ENHANCEMENT_SELECTOR: '.enhancement',
     DEFAULT_PREFERENCE_SELECTOR: '.preference',
+    SUBTITLE_RENDER_SELECTOR: '.subtitle-text',
     shadowHostObservers: new Map(),
     cleanupShadowHostObservers() {},
     disconnectShadowHostsInSubtree() {},
@@ -62,6 +67,8 @@ test('controls added later to a shadow root schedule the default-state update', 
     observeShadowHost(host);
   `, { ...context, host });
 
+  assert.equal(observedOptions.characterData, true,
+    'the observer receives text-node updates from existing subtitle elements');
   assert.equal(scheduled, 0);
   mutationCallback([{
     removedNodes: [],
@@ -76,6 +83,21 @@ test('controls added later to a shadow root schedule the default-state update', 
     target: new FakeElement()
   }]);
   assert.equal(scheduled, 2, 'state-only attribute changes schedule enforcement');
+
+  mutationCallback([{
+    type: 'childList',
+    target: new FakeElement(),
+    removedNodes: [],
+    addedNodes: []
+  }]);
+  assert.equal(scheduled, 3, 'rendered subtitle text changes schedule another state check');
+
+  mutationCallback([{
+    type: 'characterData',
+    target: new FakeText(new FakeElement())
+  }]);
+  assert.equal(scheduled, 4,
+    'updating an existing subtitle text node schedules another state check');
 });
 
 test('default-state retries cover delayed initial and SPA restoration with a finite schedule', () => {
@@ -124,6 +146,7 @@ test('subtitle controls are discovered inside captured open or closed shadow roo
   const host = { isConnected: true, shadowRoot: null };
   const context = {
     document,
+    SUBTITLE_RENDER_SELECTOR: '.subtitle-text',
     shadowHostObservers: new Map([[host, { host, root: shadowRoot }]])
   };
   vm.runInNewContext(`
@@ -175,6 +198,7 @@ test('document click listener preserves controls exposed by an open shadow root'
     setTimeout: (callback) => pendingTasks.push(callback),
     localStorage: { setItem() {} },
     getChineseSubtitleControls: () => ({ closeSwitch: null }),
+    cancelSubtitleCloseConfirmation() {},
     restoredSubtitleControls: new WeakSet(),
     subtitleEnabled: null
   };
@@ -268,6 +292,7 @@ test('closed shadow root listener preserves controls hidden from the document pa
     localStorage: { setItem() {} },
     PLAYER_ENHANCEMENT_SELECTOR: '.enhancement',
     DEFAULT_PREFERENCE_SELECTOR: '.preference',
+    SUBTITLE_RENDER_SELECTOR: '.subtitle-text',
     shadowHostObservers: new Map(),
     cleanupShadowHostObservers() {},
     disconnectShadowHostsInSubtree() {},
@@ -277,6 +302,7 @@ test('closed shadow root listener preserves controls hidden from the document pa
     startPlaylistPositionRetries() {},
     startDefaultPreferenceRetries() {},
     getChineseSubtitleControls: () => ({ closeSwitch: null }),
+    cancelSubtitleCloseConfirmation() {},
     restoredSubtitleControls: new WeakSet(),
     subtitleEnabled: null,
     host,

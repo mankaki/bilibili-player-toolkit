@@ -93,6 +93,8 @@ test('Shift+O settings entry persists all three choices', () => {
     prompt: () => answers.shift(),
     localStorage: { setItem: (key, value) => saved.set(key, value) },
     startDefaultPreferenceRetries() {},
+    cancelSubtitleCloseConfirmation() {},
+    resetSubtitleCloseAttempts() {},
     showNotice: (message) => notices.push(message),
     WeakSet
   };
@@ -129,50 +131,133 @@ test('Shift+O settings entry persists all three choices', () => {
   assert.match(source, /e\.code === 'KeyO' && e\.shiftKey/);
 });
 
-test('default-close handles AI-only subtitles and respects manual changes per video', () => {
-  let closed = true;
+test('default-close survives a continuously visible subtitle layer reused by the next part', () => {
+  let closed = false;
+  let rendered = true;
+  let subtitleText = '上一 P AI 字幕';
+  let closeSucceeds = false;
   let clicks = 0;
   let restores = 0;
+  const timers = [];
   const closeSwitch = {
     classList: { contains: () => closed },
     click() {
       clicks++;
-      closed = true;
+      if (closeSucceeds) {
+        closed = true;
+        rendered = false;
+      }
     }
   };
-  const location = { href: 'https://www.bilibili.com/video/BV1' };
+  const renderedSubtitle = {
+    get textContent() { return subtitleText; },
+    getClientRects: () => rendered ? [{}] : []
+  };
+  const location = { href: 'https://www.bilibili.com/video/BV1?p=1' };
   const context = {
     URL,
     location,
-    getChineseSubtitleControls: () => ({ chinese: null, closeSwitch }),
-    restoreChineseSubtitlePreference: () => restores++
+    getChineseSubtitleControls: () => ({
+      chinese: null, closeSwitch, renderedSubtitles: [renderedSubtitle]
+    }),
+    restoreChineseSubtitlePreference: () => restores++,
+    clearTimeout(timer) { timer.cancelled = true; },
+    setTimeout(callback, delay) {
+      const timer = { callback, delay, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+    startDefaultPreferenceRetries() {},
+    startPlaylistPositionRetries() {},
+    showInfo() {},
+    WeakSet
   };
   vm.runInNewContext(`
     const MODE_CLOSED = 'closed';
+    const MAX_SUBTITLE_CLOSE_ATTEMPTS = 3;
+    const STARTUP_NOTICE_VIDEO = 'video';
+    let startupNoticeMode = 'shortcuts';
     let subtitleDefaultMode = MODE_CLOSED;
-    let subtitleUserOverrideKey = null;
+    let observedPlaybackKey = getPlaybackKey();
+    let danmakuUserOverrideKey = null;
+    let subtitleUserOverrideKey = observedPlaybackKey;
+    let restoredSubtitleControls = new WeakSet();
+    let subtitleCloseConfirmationTimer = null;
+    let subtitleCloseConfirmationKey = null;
+    let subtitleCloseAttemptsKey = observedPlaybackKey;
+    let subtitleCloseAttempts = 0;
+    let subtitleRenderedVisible = false;
+    let subtitleRenderedSignature = '';
+    let subtitleRenderedRetryWindowOpened = false;
     ${extractFunction('getPlaybackKey')}
+    ${extractFunction('isRenderedSubtitleVisible')}
+    ${extractFunction('getRenderedSubtitleSignature')}
+    ${extractFunction('cancelSubtitleCloseConfirmation')}
+    ${extractFunction('resetSubtitleCloseAttempts')}
+    ${extractFunction('refreshSubtitleCloseAttemptWindow')}
+    ${extractFunction('confirmSubtitleClosed')}
+    ${extractFunction('scheduleSubtitleCloseConfirmation')}
     ${extractFunction('applySubtitlePreference')}
+    ${extractFunction('handlePlaybackNavigation')}
     this.apply = applySubtitlePreference;
     this.overrideCurrentVideo = () => { subtitleUserOverrideKey = getPlaybackKey(); };
+    this.navigate = handlePlaybackNavigation;
   `, context);
 
+  location.href = 'https://www.bilibili.com/video/BV1?p=2';
+  context.navigate();
   context.apply();
-  assert.equal(clicks, 0, 'an initially closed AI-only subtitle needs no action');
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 500);
+  let nextTimer = 0;
+  while (nextTimer < timers.length) {
+    const timer = timers[nextTimer++];
+    if (!timer.cancelled) timer.callback();
+  }
+  assert.equal(clicks, 3, 'stale rendered subtitles cannot cause unbounded close attempts');
+
+  closeSucceeds = true;
+  closed = false;
+  subtitleText = '下一 P AI 字幕';
+  context.apply();
+  assert.equal(timers.length, 5,
+    'changed content in the reused layer opens one fresh bounded close window');
+  timers[4].callback();
+  assert.equal(clicks, 4, 'closes the asynchronously restored AI subtitle once');
+  assert.equal(closed, true);
+  assert.equal(rendered, false, 'the new part AI subtitle is actually closed');
+  timers[5].callback();
+  assert.equal(clicks, 4, 'the successful close is confirmed without another click');
 
   closed = false;
-  context.apply();
-  assert.equal(clicks, 1, 'a delayed initial-page restore is closed again');
-
-  closed = false;
+  rendered = true;
   context.overrideCurrentVideo();
   context.apply();
-  assert.equal(clicks, 1, 'manual choice is preserved within the same video');
-
-  location.href = 'https://www.bilibili.com/video/BV2';
-  context.apply();
-  assert.equal(clicks, 2, 'SPA navigation applies the default to the next video');
+  assert.equal(clicks, 4, 'manual choice is preserved within the new part');
+  assert.equal(timers.length, 6, 'manual choice does not schedule another close');
   assert.equal(restores, 0);
+});
+
+test('a rendered subtitle update can reopen the close window only once per part', () => {
+  const context = {};
+  vm.runInNewContext(`
+    const MAX_SUBTITLE_CLOSE_ATTEMPTS = 3;
+    let subtitleCloseAttemptsKey = 'part';
+    let subtitleCloseAttempts = MAX_SUBTITLE_CLOSE_ATTEMPTS;
+    let subtitleRenderedVisible = true;
+    let subtitleRenderedSignature = 'old subtitle';
+    let subtitleRenderedRetryWindowOpened = false;
+    ${extractFunction('resetSubtitleCloseAttempts')}
+    ${extractFunction('refreshSubtitleCloseAttemptWindow')}
+    refreshSubtitleCloseAttemptWindow('part', 'new AI subtitle');
+    this.firstAttempts = subtitleCloseAttempts;
+    subtitleCloseAttempts = MAX_SUBTITLE_CLOSE_ATTEMPTS;
+    refreshSubtitleCloseAttemptWindow('part', 'later subtitle line');
+    this.secondAttempts = subtitleCloseAttempts;
+  `, context);
+
+  assert.equal(context.firstAttempts, 0, 'the first update to the reused layer gets fresh attempts');
+  assert.equal(context.secondAttempts, 3, 'later subtitle lines cannot reopen the window');
 });
 
 test('subtitle unchanged mode preserves the existing restore behavior', () => {
@@ -181,7 +266,8 @@ test('subtitle unchanged mode preserves the existing restore behavior', () => {
     URL,
     location: { href: 'https://www.bilibili.com/video/BV1' },
     getChineseSubtitleControls: () => ({ chinese: null, closeSwitch: null }),
-    restoreChineseSubtitlePreference: () => restores++
+    restoreChineseSubtitlePreference: () => restores++,
+    cancelSubtitleCloseConfirmation() {}
   };
   vm.runInNewContext(`
     const MODE_CLOSED = 'closed';
@@ -204,7 +290,13 @@ test('navigation ignores incidental URL changes but resets overrides for a new p
     WeakSet,
     startDefaultPreferenceRetries: () => scheduled++,
     startPlaylistPositionRetries: () => {},
-    showInfo: () => notices++
+    showInfo: () => notices++,
+    cancelSubtitleCloseConfirmation() {},
+    resetSubtitleCloseAttempts(_playbackKey, renderedSignature) {
+      assert.equal(renderedSignature, '');
+    },
+    getChineseSubtitleControls: () => ({ renderedSubtitles: [] }),
+    getRenderedSubtitleSignature: () => ''
   };
   vm.runInNewContext(`
     const STARTUP_NOTICE_VIDEO = 'video';

@@ -27,6 +27,7 @@
   const KEY_SUBTITLE_DEFAULT = `${SETTINGS_STORAGE_PREFIX}subtitle_default`;
   const MODE_UNCHANGED = 'unchanged';
   const MODE_CLOSED = 'closed';
+  const MAX_SUBTITLE_CLOSE_ATTEMPTS = 3;
   const STARTUP_NOTICE_SHORTCUTS = 'shortcuts';
   const STARTUP_NOTICE_VIDEO = 'video';
   function getStoredValue(key) {
@@ -78,6 +79,11 @@
   let danmakuUserOverrideKey = null;
   let subtitleUserOverrideKey = null;
   const handledManualControlEvents = new WeakSet();
+  const SUBTITLE_RENDER_SELECTOR = [
+    '.bpx-player-subtitle-panel-text',
+    '.bpx-player-subtitle-wrap .bpx-player-subtitle-item',
+    '.bilibili-player-video-subtitle .subtitle-item'
+  ].join(', ');
   const PLAYER_ENHANCEMENT_SELECTOR = [
     '.bpx-player-ctrl-subtitle',
     '.bpx-player-ctrl-subtitle-title',
@@ -88,7 +94,8 @@
     '.bpx-player-ctrl-eplist-episodes-content',
     '.bpx-player-ctrl-eplist-multi-menu-item',
     '.video-pod__body',
-    '.simple-base-item.page-item'
+    '.simple-base-item.page-item',
+    SUBTITLE_RENDER_SELECTOR
   ].join(', ');
   const DEFAULT_PREFERENCE_SELECTOR = [
     '.bpx-player-ctrl-subtitle-language-item',
@@ -98,6 +105,13 @@
   ].join(', ');
   let enhancementUpdateFrame = null;
   let defaultPreferenceRetryTimers = [];
+  let subtitleCloseConfirmationTimer = null;
+  let subtitleCloseConfirmationKey = null;
+  let subtitleCloseAttemptsKey = observedPlaybackKey;
+  let subtitleCloseAttempts = 0;
+  let subtitleRenderedVisible = false;
+  let subtitleRenderedSignature = '';
+  let subtitleRenderedRetryWindowOpened = false;
   let playlistPositionRetryTimers = [];
   let lastPlaylistPositionKey = null;
   let nextPlaylistElementId = 1;
@@ -360,7 +374,17 @@
   }
 
   function isDefaultPreferenceStateMutation(mutation) {
-    return mutation.type === 'attributes'
+    const renderedSubtitleTarget = mutation.type === 'characterData'
+      ? mutation.target.parentElement
+      : mutation.target;
+    const isRenderedSubtitleChange = (mutation.type === 'childList'
+      || mutation.type === 'characterData')
+      && renderedSubtitleTarget instanceof Element
+      && (
+        renderedSubtitleTarget.matches(SUBTITLE_RENDER_SELECTOR) ||
+        renderedSubtitleTarget.closest(SUBTITLE_RENDER_SELECTOR)
+      );
+    return isRenderedSubtitleChange || mutation.type === 'attributes'
       && mutation.target instanceof Element
       && (
         mutation.target.matches(DEFAULT_PREFERENCE_SELECTOR) ||
@@ -396,24 +420,117 @@
     });
     const [closeSwitch] = queryPlayerElements('.bpx-player-ctrl-subtitle-close-switch');
 
-    return { chinese, closeSwitch };
+    const renderedSubtitles = queryPlayerElements(SUBTITLE_RENDER_SELECTOR);
+
+    return { chinese, closeSwitch, renderedSubtitles };
+  }
+
+  function isRenderedSubtitleVisible(element) {
+    if (!(element.textContent || '').trim()) return false;
+    if (typeof element.checkVisibility === 'function') {
+      return element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+    }
+    return typeof element.getClientRects !== 'function' || element.getClientRects().length > 0;
+  }
+
+  function getRenderedSubtitleSignature(renderedSubtitles) {
+    return renderedSubtitles
+      .filter(isRenderedSubtitleVisible)
+      .map((element) => {
+        const language = typeof element.getAttribute === 'function'
+          ? element.getAttribute('data-lan') || element.getAttribute('lang') || ''
+          : '';
+        return `${language}\u0000${(element.textContent || '').trim()}`;
+      })
+      .join('\u0001');
+  }
+
+  function cancelSubtitleCloseConfirmation(playbackKey = null) {
+    if (playbackKey !== null && subtitleCloseConfirmationKey !== playbackKey) return;
+    if (subtitleCloseConfirmationTimer !== null) clearTimeout(subtitleCloseConfirmationTimer);
+    subtitleCloseConfirmationTimer = null;
+    subtitleCloseConfirmationKey = null;
+  }
+
+  function resetSubtitleCloseAttempts(playbackKey = getPlaybackKey(), renderedSignature = '') {
+    subtitleCloseAttemptsKey = playbackKey;
+    subtitleCloseAttempts = 0;
+    subtitleRenderedVisible = renderedSignature !== '';
+    subtitleRenderedSignature = renderedSignature;
+    subtitleRenderedRetryWindowOpened = false;
+  }
+
+  function refreshSubtitleCloseAttemptWindow(playbackKey, renderedSignature) {
+    if (subtitleCloseAttemptsKey !== playbackKey) resetSubtitleCloseAttempts(playbackKey);
+    const isRendered = renderedSignature !== '';
+    const renderedLayerAppeared = isRendered && !subtitleRenderedVisible;
+    const reusedLayerChanged = isRendered && subtitleRenderedVisible
+      && renderedSignature !== subtitleRenderedSignature
+      && subtitleCloseAttempts >= MAX_SUBTITLE_CLOSE_ATTEMPTS;
+    if (!subtitleRenderedRetryWindowOpened && (renderedLayerAppeared || reusedLayerChanged)) {
+      // 切 P 后只允许字幕新出现或残留层内容更新时重开一次，避免逐条更新无限重试。
+      subtitleRenderedRetryWindowOpened = true;
+      subtitleCloseAttempts = 0;
+      subtitleRenderedSignature = renderedSignature;
+    }
+    subtitleRenderedVisible = isRendered;
+  }
+
+  function confirmSubtitleClosed(playbackKey) {
+    subtitleCloseConfirmationTimer = null;
+    subtitleCloseConfirmationKey = null;
+    if (subtitleDefaultMode !== MODE_CLOSED || getPlaybackKey() !== playbackKey
+      || subtitleUserOverrideKey === playbackKey) return;
+
+    const { closeSwitch, renderedSubtitles } = getChineseSubtitleControls();
+    if (!closeSwitch) return;
+
+    const isClosed = closeSwitch.classList.contains('bpx-state-active');
+    const renderedSignature = getRenderedSubtitleSignature(renderedSubtitles);
+    const isRendered = renderedSignature !== '';
+    refreshSubtitleCloseAttemptWindow(playbackKey, renderedSignature);
+    if ((!isClosed || isRendered) && subtitleCloseAttempts < MAX_SUBTITLE_CLOSE_ATTEMPTS) {
+      subtitleCloseAttempts++;
+      closeSwitch.click();
+      // 点击可能只显示“字幕已关闭”提示而未改变 DOM；主动复核，不依赖外部 mutation。
+      scheduleSubtitleCloseConfirmation(playbackKey, true);
+    }
+  }
+
+  function scheduleSubtitleCloseConfirmation(playbackKey, verifyLastAttempt = false) {
+    if (subtitleCloseAttemptsKey !== playbackKey) resetSubtitleCloseAttempts(playbackKey);
+    if (!verifyLastAttempt && subtitleCloseAttempts >= MAX_SUBTITLE_CLOSE_ATTEMPTS) return;
+    if (subtitleCloseConfirmationKey === playbackKey) return;
+    cancelSubtitleCloseConfirmation();
+    subtitleCloseConfirmationKey = playbackKey;
+    // 切 P 时播放器会先沿用旧控件状态，再异步加载字幕列表和记忆的语言。
+    subtitleCloseConfirmationTimer = setTimeout(() => {
+      confirmSubtitleClosed(playbackKey);
+    }, 500);
   }
 
   function applySubtitlePreference() {
     if (subtitleDefaultMode !== MODE_CLOSED) {
+      cancelSubtitleCloseConfirmation();
       restoreChineseSubtitlePreference();
       return;
     }
 
     const playbackKey = getPlaybackKey();
-    if (subtitleUserOverrideKey === playbackKey) return;
+    if (subtitleUserOverrideKey === playbackKey) {
+      cancelSubtitleCloseConfirmation(playbackKey);
+      return;
+    }
 
-    const { closeSwitch } = getChineseSubtitleControls();
+    const { closeSwitch, renderedSubtitles } = getChineseSubtitleControls();
     if (!closeSwitch) return;
 
-    if (!closeSwitch.classList.contains('bpx-state-active')) {
-      closeSwitch.click();
-    }
+    const isClosed = closeSwitch.classList.contains('bpx-state-active');
+    const renderedSignature = getRenderedSubtitleSignature(renderedSubtitles);
+    const isRendered = renderedSignature !== '';
+    refreshSubtitleCloseAttemptWindow(playbackKey, renderedSignature);
+    if (!isClosed || isRendered) scheduleSubtitleCloseConfirmation(playbackKey);
+    else cancelSubtitleCloseConfirmation(playbackKey);
   }
 
   function restoreChineseSubtitlePreference() {
@@ -477,6 +594,7 @@
     handledManualControlEvents.add(event);
     if (subtitleControl) {
       subtitleUserOverrideKey = getPlaybackKey();
+      cancelSubtitleCloseConfirmation(subtitleUserOverrideKey);
       // B站在点击处理器中更新 active class，下一轮任务再读取最终状态。
       setTimeout(saveNativeSubtitleState, 0);
     }
@@ -594,6 +712,8 @@
     subtitleDefaultMode = nextMode;
     subtitleUserOverrideKey = null;
     restoredSubtitleControls = new WeakSet();
+    cancelSubtitleCloseConfirmation();
+    resetSubtitleCloseAttempts();
     startDefaultPreferenceRetries();
     showNotice(closeByDefault ? '字幕：打开视频时默认关闭' : '字幕：不处理');
   }
@@ -845,6 +965,7 @@
     observer.observe(root, {
       childList: true,
       subtree: true,
+      characterData: true,
       attributes: true,
       attributeFilter: ['aria-checked', 'checked', 'class']
     });
@@ -893,6 +1014,11 @@
     if (playbackKey === observedPlaybackKey) return;
 
     observedPlaybackKey = playbackKey;
+    cancelSubtitleCloseConfirmation();
+    const { renderedSubtitles } = getChineseSubtitleControls();
+    resetSubtitleCloseAttempts(
+      playbackKey, getRenderedSubtitleSignature(renderedSubtitles)
+    );
     danmakuUserOverrideKey = null;
     subtitleUserOverrideKey = null;
     restoredSubtitleControls = new WeakSet();
@@ -920,6 +1046,7 @@
       documentObserver.observe(document.documentElement, {
         childList: true,
         subtree: true,
+        characterData: true,
         attributes: true,
         attributeFilter: ['aria-checked', 'checked', 'class']
       });
