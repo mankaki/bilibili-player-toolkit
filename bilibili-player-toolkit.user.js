@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站播放器增强工具箱
 // @namespace    https://www.bilibili.com/
-// @version      3.1.10
+// @version      3.2.0
 // @description  自动跳片头片尾、选集显示 P 序号、C 键切换中文字幕、D 键切换弹幕开关，并优先使用新版画中画
 // @author       mankaki (modified)
 // @match        *://www.bilibili.com/video/*
@@ -16,28 +16,102 @@
 (function () {
   'use strict';
 
-  const TOOLKIT_VERSION = '3.1.10';
+  const TOOLKIT_VERSION = '3.2.0';
   const KEY_HEAD = 'bili_skip_head';
   const KEY_TAIL = 'bili_skip_tail';
   const KEY_ENABLED = 'bili_skip_enabled';
   const KEY_SUBTITLE_ENABLED = 'bili_chinese_subtitle_enabled';
-  const storedSubtitlePreference = localStorage.getItem(KEY_SUBTITLE_ENABLED);
+  const SETTINGS_STORAGE_PREFIX = 'bilibili_player_toolkit:';
+  const KEY_STARTUP_NOTICE = `${SETTINGS_STORAGE_PREFIX}startup_notice`;
+  const KEY_DANMAKU_DEFAULT = `${SETTINGS_STORAGE_PREFIX}danmaku_default`;
+  const KEY_SUBTITLE_DEFAULT = `${SETTINGS_STORAGE_PREFIX}subtitle_default`;
+  const MODE_UNCHANGED = 'unchanged';
+  const MODE_CLOSED = 'closed';
+  const MAX_SUBTITLE_CLOSE_ATTEMPTS = 3;
+  const STARTUP_NOTICE_SHORTCUTS = 'shortcuts';
+  const STARTUP_NOTICE_VIDEO = 'video';
+  function getStoredValue(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  }
+
+  function setStoredValue(key, value) {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function readSetting(key, fallback, allowedValues) {
+    const value = getStoredValue(key);
+    return allowedValues.includes(value) ? value : fallback;
+  }
+
+  function writeSetting(key, value) {
+    if (!setStoredValue(key, value)) {
+      showNotice('设置保存失败，请检查浏览器站点存储权限');
+      return false;
+    }
+    return true;
+  }
+
+  let startupNoticeMode = readSetting(
+    KEY_STARTUP_NOTICE, STARTUP_NOTICE_SHORTCUTS,
+    [STARTUP_NOTICE_SHORTCUTS, STARTUP_NOTICE_VIDEO]
+  );
+  let danmakuDefaultMode = readSetting(
+    KEY_DANMAKU_DEFAULT, MODE_UNCHANGED, [MODE_UNCHANGED, MODE_CLOSED]
+  );
+  let subtitleDefaultMode = readSetting(
+    KEY_SUBTITLE_DEFAULT, MODE_UNCHANGED, [MODE_UNCHANGED, MODE_CLOSED]
+  );
+  const storedSubtitlePreference = getStoredValue(KEY_SUBTITLE_ENABLED);
   let subtitleEnabled = storedSubtitlePreference === null
     ? null
     : storedSubtitlePreference === 'true';
-  const restoredSubtitleControls = new WeakSet();
+  let restoredSubtitleControls = new WeakSet();
+  let observedPlaybackKey = getPlaybackKey();
+  let danmakuUserOverrideKey = null;
+  let subtitleUserOverrideKey = null;
+  const handledManualControlEvents = new WeakSet();
+  const SUBTITLE_RENDER_SELECTOR = [
+    '.bpx-player-subtitle-panel-text',
+    '.bpx-player-subtitle-wrap .bpx-player-subtitle-item',
+    '.bilibili-player-video-subtitle .subtitle-item'
+  ].join(', ');
   const PLAYER_ENHANCEMENT_SELECTOR = [
     '.bpx-player-ctrl-subtitle',
     '.bpx-player-ctrl-subtitle-title',
     '.bpx-player-ctrl-subtitle-language-item',
     '.bpx-player-ctrl-subtitle-close-switch',
+    '.bpx-player-dm-switch',
     '.bpx-player-ctrl-pip-menu-item',
     '.bpx-player-ctrl-eplist-episodes-content',
     '.bpx-player-ctrl-eplist-multi-menu-item',
     '.video-pod__body',
-    '.simple-base-item.page-item'
+    '.simple-base-item.page-item',
+    SUBTITLE_RENDER_SELECTOR
+  ].join(', ');
+  const DEFAULT_PREFERENCE_SELECTOR = [
+    '.bpx-player-ctrl-subtitle-language-item',
+    '.bpx-player-ctrl-subtitle-close-switch',
+    '.bpx-player-dm-switch',
+    '.bpx-player-dm-switch input[type="checkbox"]'
   ].join(', ');
   let enhancementUpdateFrame = null;
+  let defaultPreferenceRetryTimers = [];
+  let subtitleCloseConfirmationTimer = null;
+  let subtitleCloseConfirmationKey = null;
+  let subtitleCloseAttemptsKey = observedPlaybackKey;
+  let subtitleCloseAttempts = 0;
+  let subtitleRenderedVisible = false;
+  let subtitleRenderedSignature = '';
+  let subtitleRenderedRetryWindowOpened = false;
   let playlistPositionRetryTimers = [];
   let lastPlaylistPositionKey = null;
   let nextPlaylistElementId = 1;
@@ -78,13 +152,13 @@
   }
 
   function updateNativeSubtitleTip() {
-    document.querySelectorAll('.bpx-player-ctrl-subtitle').forEach((button) => {
+    queryPlayerElements('.bpx-player-ctrl-subtitle').forEach((button) => {
       if (button.getAttribute('aria-label') !== '字幕 (c)') {
         button.setAttribute('aria-label', '字幕 (c)');
       }
     });
 
-    document.querySelectorAll('.bpx-player-ctrl-subtitle-title').forEach((title) => {
+    queryPlayerElements('.bpx-player-ctrl-subtitle-title').forEach((title) => {
       if (title.textContent !== '字幕 (c)') {
         title.textContent = '字幕 (c)';
       }
@@ -92,12 +166,90 @@
   }
 
   function preferSubtitlePictureInPicture() {
-    const items = Array.from(document.querySelectorAll('.bpx-player-ctrl-pip-menu-item'));
+    const items = queryPlayerElements('.bpx-player-ctrl-pip-menu-item');
     const modernMode = items.find((item) => /新版画中画/.test(item.textContent || ''));
 
     if (modernMode && !modernMode.classList.contains('bpx-state-active')) {
       modernMode.click();
     }
+  }
+
+  function getPlaybackKey() {
+    const url = new URL(location.href);
+    const path = url.pathname.replace(/\/+$/, '');
+    const videoMatch = path.match(/^\/video\/(BV[\w]+|av\d+)/i);
+    const bangumiMatch = path.match(/^\/bangumi\/play\/(ep\d+|ss\d+)/i);
+    const listMatch = path.match(/^\/list\/([^/]+)/i);
+    let pageKey = `page:${path}`;
+    let parameterNames = [];
+
+    if (videoMatch) {
+      pageKey = `video:${videoMatch[1].toLowerCase()}`;
+      parameterNames = ['cid'];
+    } else if (bangumiMatch) {
+      pageKey = `bangumi:${bangumiMatch[1].toLowerCase()}`;
+      parameterNames = ['ep_id', 'cid'];
+    } else if (listMatch) {
+      pageKey = `list:${listMatch[1].toLowerCase()}`;
+      parameterNames = ['bvid', 'aid', 'oid', 'cid'];
+    }
+
+    const playbackParameters = parameterNames
+      .filter((name) => url.searchParams.has(name))
+      .map((name) => `${name}=${url.searchParams.get(name)}`);
+    if (videoMatch || listMatch) {
+      playbackParameters.push(`p=${url.searchParams.get('p') || '1'}`);
+    }
+    return [pageKey, ...playbackParameters].join('|');
+  }
+
+  function getPlayerRoots() {
+    const roots = [document];
+    shadowHostObservers.forEach(({ host, root }) => {
+      const shadowRoot = root || host.shadowRoot;
+      if (host.isConnected && shadowRoot) roots.push(shadowRoot);
+    });
+    return roots;
+  }
+
+  function queryPlayerElements(selector) {
+    return getPlayerRoots().flatMap((root) => Array.from(root.querySelectorAll(selector)));
+  }
+
+  function findDanmakuSwitch() {
+    for (const root of getPlayerRoots()) {
+      for (const control of root.querySelectorAll('.bpx-player-dm-switch')) {
+        const input = control.querySelector('input[type="checkbox"]');
+        if (input && !input.disabled && control.getClientRects().length) return control;
+      }
+    }
+    return null;
+  }
+
+  function closeDanmaku(control) {
+    const input = control.querySelector('input[type="checkbox"]');
+    const state = input.getAttribute('aria-checked');
+    if (state === 'false' || (state === null && !input.checked)) return;
+
+    input.click();
+    // 新版原生循环为开启 → 精简 → 关闭；旧版两档开关无需额外点击。
+    skipSimplifiedDanmakuState(input);
+  }
+
+  function skipSimplifiedDanmakuState(input) {
+    if (input.getAttribute('aria-checked') === 'mixed') input.click();
+  }
+
+  function applyDefaultDanmakuPreference() {
+    if (danmakuDefaultMode !== MODE_CLOSED) return;
+
+    const playbackKey = getPlaybackKey();
+    if (danmakuUserOverrideKey === playbackKey) return;
+
+    const control = findDanmakuSwitch();
+    if (!control) return;
+
+    closeDanmaku(control);
   }
 
   const CURRENT_PLAYLIST_ITEM_SELECTOR = [
@@ -202,7 +354,8 @@
   function updatePlayerEnhancements() {
     updateNativeSubtitleTip();
     preferSubtitlePictureInPicture();
-    restoreChineseSubtitlePreference();
+    applySubtitlePreference();
+    applyDefaultDanmakuPreference();
     positionPlaylistAtCurrentItem();
   }
 
@@ -211,6 +364,32 @@
       node.matches(PLAYER_ENHANCEMENT_SELECTOR) ||
       node.querySelector(PLAYER_ENHANCEMENT_SELECTOR)
     );
+  }
+
+  function mayContainDefaultPreferenceControl(node) {
+    return node instanceof Element && (
+      node.matches(DEFAULT_PREFERENCE_SELECTOR) ||
+      node.querySelector(DEFAULT_PREFERENCE_SELECTOR)
+    );
+  }
+
+  function isDefaultPreferenceStateMutation(mutation) {
+    const renderedSubtitleTarget = mutation.type === 'characterData'
+      ? mutation.target.parentElement
+      : mutation.target;
+    const isRenderedSubtitleChange = (mutation.type === 'childList'
+      || mutation.type === 'characterData')
+      && renderedSubtitleTarget instanceof Element
+      && (
+        renderedSubtitleTarget.matches(SUBTITLE_RENDER_SELECTOR) ||
+        renderedSubtitleTarget.closest(SUBTITLE_RENDER_SELECTOR)
+      );
+    return isRenderedSubtitleChange || mutation.type === 'attributes'
+      && mutation.target instanceof Element
+      && (
+        mutation.target.matches(DEFAULT_PREFERENCE_SELECTOR) ||
+        mutation.target.closest(DEFAULT_PREFERENCE_SELECTOR)
+      );
   }
 
   function schedulePlayerEnhancementUpdate() {
@@ -222,16 +401,136 @@
     });
   }
 
+  function startDefaultPreferenceRetries() {
+    defaultPreferenceRetryTimers.forEach(clearTimeout);
+    defaultPreferenceRetryTimers = [];
+
+    // 播放器会在控件出现后异步恢复弹幕或字幕状态，轮询设有上限。
+    [0, 100, 250, 500, 1000, 2000, 4000, 7000].forEach((delay) => {
+      defaultPreferenceRetryTimers.push(setTimeout(schedulePlayerEnhancementUpdate, delay));
+    });
+  }
+
   function getChineseSubtitleControls() {
-    const items = Array.from(document.querySelectorAll('.bpx-player-ctrl-subtitle-language-item'));
+    const items = queryPlayerElements('.bpx-player-ctrl-subtitle-language-item');
     const chinese = items.find((item) => {
       const language = item.getAttribute('data-lan') || '';
       const text = item.textContent || '';
       return /(^|[-_*])zh([-_*]|$)/i.test(language) || /中文|简体|繁体/.test(text);
     });
-    const closeSwitch = document.querySelector('.bpx-player-ctrl-subtitle-close-switch');
+    const [closeSwitch] = queryPlayerElements('.bpx-player-ctrl-subtitle-close-switch');
 
-    return { chinese, closeSwitch };
+    const renderedSubtitles = queryPlayerElements(SUBTITLE_RENDER_SELECTOR);
+
+    return { chinese, closeSwitch, renderedSubtitles };
+  }
+
+  function isRenderedSubtitleVisible(element) {
+    if (!(element.textContent || '').trim()) return false;
+    if (typeof element.checkVisibility === 'function') {
+      return element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+    }
+    return typeof element.getClientRects !== 'function' || element.getClientRects().length > 0;
+  }
+
+  function getRenderedSubtitleSignature(renderedSubtitles) {
+    return renderedSubtitles
+      .filter(isRenderedSubtitleVisible)
+      .map((element) => {
+        const language = typeof element.getAttribute === 'function'
+          ? element.getAttribute('data-lan') || element.getAttribute('lang') || ''
+          : '';
+        return `${language}\u0000${(element.textContent || '').trim()}`;
+      })
+      .join('\u0001');
+  }
+
+  function cancelSubtitleCloseConfirmation(playbackKey = null) {
+    if (playbackKey !== null && subtitleCloseConfirmationKey !== playbackKey) return;
+    if (subtitleCloseConfirmationTimer !== null) clearTimeout(subtitleCloseConfirmationTimer);
+    subtitleCloseConfirmationTimer = null;
+    subtitleCloseConfirmationKey = null;
+  }
+
+  function resetSubtitleCloseAttempts(playbackKey = getPlaybackKey(), renderedSignature = '') {
+    subtitleCloseAttemptsKey = playbackKey;
+    subtitleCloseAttempts = 0;
+    subtitleRenderedVisible = renderedSignature !== '';
+    subtitleRenderedSignature = renderedSignature;
+    subtitleRenderedRetryWindowOpened = false;
+  }
+
+  function refreshSubtitleCloseAttemptWindow(playbackKey, renderedSignature) {
+    if (subtitleCloseAttemptsKey !== playbackKey) resetSubtitleCloseAttempts(playbackKey);
+    const isRendered = renderedSignature !== '';
+    const renderedLayerAppeared = isRendered && !subtitleRenderedVisible;
+    const reusedLayerChanged = isRendered && subtitleRenderedVisible
+      && renderedSignature !== subtitleRenderedSignature
+      && subtitleCloseAttempts >= MAX_SUBTITLE_CLOSE_ATTEMPTS;
+    if (!subtitleRenderedRetryWindowOpened && (renderedLayerAppeared || reusedLayerChanged)) {
+      // 切 P 后只允许字幕新出现或残留层内容更新时重开一次，避免逐条更新无限重试。
+      subtitleRenderedRetryWindowOpened = true;
+      subtitleCloseAttempts = 0;
+      subtitleRenderedSignature = renderedSignature;
+    }
+    subtitleRenderedVisible = isRendered;
+  }
+
+  function confirmSubtitleClosed(playbackKey) {
+    subtitleCloseConfirmationTimer = null;
+    subtitleCloseConfirmationKey = null;
+    if (subtitleDefaultMode !== MODE_CLOSED || getPlaybackKey() !== playbackKey
+      || subtitleUserOverrideKey === playbackKey) return;
+
+    const { closeSwitch, renderedSubtitles } = getChineseSubtitleControls();
+    if (!closeSwitch) return;
+
+    const isClosed = closeSwitch.classList.contains('bpx-state-active');
+    const renderedSignature = getRenderedSubtitleSignature(renderedSubtitles);
+    const isRendered = renderedSignature !== '';
+    refreshSubtitleCloseAttemptWindow(playbackKey, renderedSignature);
+    if ((!isClosed || isRendered) && subtitleCloseAttempts < MAX_SUBTITLE_CLOSE_ATTEMPTS) {
+      subtitleCloseAttempts++;
+      closeSwitch.click();
+      // 点击可能只显示“字幕已关闭”提示而未改变 DOM；主动复核，不依赖外部 mutation。
+      scheduleSubtitleCloseConfirmation(playbackKey, true);
+    }
+  }
+
+  function scheduleSubtitleCloseConfirmation(playbackKey, verifyLastAttempt = false) {
+    if (subtitleCloseAttemptsKey !== playbackKey) resetSubtitleCloseAttempts(playbackKey);
+    if (!verifyLastAttempt && subtitleCloseAttempts >= MAX_SUBTITLE_CLOSE_ATTEMPTS) return;
+    if (subtitleCloseConfirmationKey === playbackKey) return;
+    cancelSubtitleCloseConfirmation();
+    subtitleCloseConfirmationKey = playbackKey;
+    // 切 P 时播放器会先沿用旧控件状态，再异步加载字幕列表和记忆的语言。
+    subtitleCloseConfirmationTimer = setTimeout(() => {
+      confirmSubtitleClosed(playbackKey);
+    }, 500);
+  }
+
+  function applySubtitlePreference() {
+    if (subtitleDefaultMode !== MODE_CLOSED) {
+      cancelSubtitleCloseConfirmation();
+      restoreChineseSubtitlePreference();
+      return;
+    }
+
+    const playbackKey = getPlaybackKey();
+    if (subtitleUserOverrideKey === playbackKey) {
+      cancelSubtitleCloseConfirmation(playbackKey);
+      return;
+    }
+
+    const { closeSwitch, renderedSubtitles } = getChineseSubtitleControls();
+    if (!closeSwitch) return;
+
+    const isClosed = closeSwitch.classList.contains('bpx-state-active');
+    const renderedSignature = getRenderedSubtitleSignature(renderedSubtitles);
+    const isRendered = renderedSignature !== '';
+    refreshSubtitleCloseAttemptWindow(playbackKey, renderedSignature);
+    if (!isClosed || isRendered) scheduleSubtitleCloseConfirmation(playbackKey);
+    else cancelSubtitleCloseConfirmation(playbackKey);
   }
 
   function restoreChineseSubtitlePreference() {
@@ -258,7 +557,7 @@
     if (!closeSwitch) return;
 
     subtitleEnabled = !closeSwitch.classList.contains('bpx-state-active');
-    localStorage.setItem(KEY_SUBTITLE_ENABLED, subtitleEnabled);
+    setStoredValue(KEY_SUBTITLE_ENABLED, subtitleEnabled);
     restoredSubtitleControls.add(closeSwitch);
   }
 
@@ -270,8 +569,9 @@
     const isClosed = closeSwitch.classList.contains('bpx-state-active');
     const isChineseActive = chinese.classList.contains('bpx-state-active');
     subtitleEnabled = !(isChineseActive && !isClosed);
-    localStorage.setItem(KEY_SUBTITLE_ENABLED, subtitleEnabled);
+    setStoredValue(KEY_SUBTITLE_ENABLED, subtitleEnabled);
     restoredSubtitleControls.add(closeSwitch);
+    subtitleUserOverrideKey = getPlaybackKey();
 
     if (subtitleEnabled) {
       chinese.click();
@@ -280,21 +580,41 @@
     }
   }
 
-  document.addEventListener('click', (event) => {
-    if (!event.isTrusted || !(event.target instanceof Element)) return;
+  function handleManualPlayerControlClick(event) {
+    if (!event.isTrusted || handledManualControlEvents.has(event)) return;
 
-    const subtitleControl = event.target.closest(
+    const subtitleControl = findControlInEvent(event,
       '.bpx-player-ctrl-subtitle-language-item, .bpx-player-ctrl-subtitle-close-switch'
     );
-    if (!subtitleControl) return;
+    const danmakuControl = danmakuDefaultMode === MODE_CLOSED
+      ? findControlInEvent(event, '.bpx-player-dm-switch')
+      : null;
+    if (!subtitleControl && !danmakuControl) return;
 
-    // B站在点击处理器中更新 active class，下一轮任务再读取最终状态。
-    setTimeout(saveNativeSubtitleState, 0);
-  }, true);
+    handledManualControlEvents.add(event);
+    if (subtitleControl) {
+      subtitleUserOverrideKey = getPlaybackKey();
+      cancelSubtitleCloseConfirmation(subtitleUserOverrideKey);
+      // B站在点击处理器中更新 active class，下一轮任务再读取最终状态。
+      setTimeout(saveNativeSubtitleState, 0);
+    }
+
+    const input = danmakuControl?.querySelector('input[type="checkbox"]');
+    if (!input) return;
+
+    danmakuUserOverrideKey = getPlaybackKey();
+
+    // 原生按钮从关闭状态开启后应停在“全部弹幕”，不保留“精简弹幕”。
+    setTimeout(() => {
+      skipSimplifiedDanmakuState(input);
+    }, 0);
+  }
+
+  document.addEventListener('click', handleManualPlayerControlClick, true);
 
   // 修复因为 0 导致的 || 短路问题
   function getNumberFromStorage(key) {
-    const val = localStorage.getItem(key);
+    const val = getStoredValue(key);
     if (val === null || val === '') return null;
     const parsed = parseFloat(val);
     return isNaN(parsed) ? null : parsed;
@@ -302,7 +622,7 @@
 
   let headSec = getNumberFromStorage(KEY_HEAD);
   let tailSec = getNumberFromStorage(KEY_TAIL);
-  let enabled = localStorage.getItem(KEY_ENABLED) === 'true';
+  let enabled = getStoredValue(KEY_ENABLED) === 'true';
 
   // 创建浮窗
   const infoDiv = document.createElement('div');
@@ -326,18 +646,91 @@
     targetContainer.appendChild(infoDiv);
   }
 
+  function showNotice(message) {
+    ensureInfoDivMounted();
+    infoDiv.textContent = message;
+    infoDiv.style.opacity = '1';
+
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => infoDiv.style.opacity = '0', 3000);
+  }
+
   function showInfo() {
     const head = headSec !== null ? formatTime(headSec) : '—';
     const tail = tailSec !== null ? formatTime(tailSec) : '—';
     const status = enabled ? '✅ 开启' : '❌ 关闭';
 
-    ensureInfoDivMounted();
+    showNotice(`片头: ${head}  片尾时长: ${tail}  状态: ${status}`);
+  }
 
-    infoDiv.textContent = `片头: ${head}  片尾时长: ${tail}  状态: ${status}`;
-    infoDiv.style.opacity = '1';
+  function selectSetting(title, firstLabel, secondLabel, secondSelected) {
+    const choice = prompt(
+      `${title}\n\n1. ${firstLabel}\n2. ${secondLabel}\n\n请输入 1 或 2：`,
+      secondSelected ? '2' : '1'
+    );
+    if (choice === null) return null;
+    if (choice.trim() === '1') return false;
+    if (choice.trim() === '2') return true;
+    showNotice(`${title}：输入无效，设置未修改`);
+    return null;
+  }
 
-    if (hideTimer) clearTimeout(hideTimer);
-    hideTimer = setTimeout(() => infoDiv.style.opacity = '0', 3000);
+  function configureStartupNotice() {
+    const showOnVideoOpen = selectSetting(
+      '启动提示', '仅在 O、Shift+M 等快捷键操作时显示', '打开视频即显示',
+      startupNoticeMode === STARTUP_NOTICE_VIDEO
+    );
+    if (showOnVideoOpen === null) return;
+    const nextMode = showOnVideoOpen ? STARTUP_NOTICE_VIDEO : STARTUP_NOTICE_SHORTCUTS;
+    if (!writeSetting(KEY_STARTUP_NOTICE, nextMode)) return;
+    startupNoticeMode = nextMode;
+    showNotice(showOnVideoOpen ? '启动提示：打开视频即显示' : '启动提示：仅快捷键操作时显示');
+  }
+
+  function configureDanmakuDefault() {
+    const closeByDefault = selectSetting(
+      '弹幕默认状态', '不处理（保持 B 站状态）', '打开视频时默认关闭',
+      danmakuDefaultMode === MODE_CLOSED
+    );
+    if (closeByDefault === null) return;
+    const nextMode = closeByDefault ? MODE_CLOSED : MODE_UNCHANGED;
+    if (!writeSetting(KEY_DANMAKU_DEFAULT, nextMode)) return;
+    danmakuDefaultMode = nextMode;
+    danmakuUserOverrideKey = null;
+    startDefaultPreferenceRetries();
+    showNotice(closeByDefault ? '弹幕：打开视频时默认关闭' : '弹幕：不处理');
+  }
+
+  function configureSubtitleDefault() {
+    const closeByDefault = selectSetting(
+      '字幕默认状态', '不处理（保持原有字幕记忆行为）', '打开视频时默认关闭',
+      subtitleDefaultMode === MODE_CLOSED
+    );
+    if (closeByDefault === null) return;
+    const nextMode = closeByDefault ? MODE_CLOSED : MODE_UNCHANGED;
+    if (!writeSetting(KEY_SUBTITLE_DEFAULT, nextMode)) return;
+    subtitleDefaultMode = nextMode;
+    subtitleUserOverrideKey = null;
+    restoredSubtitleControls = new WeakSet();
+    cancelSubtitleCloseConfirmation();
+    resetSubtitleCloseAttempts();
+    startDefaultPreferenceRetries();
+    showNotice(closeByDefault ? '字幕：打开视频时默认关闭' : '字幕：不处理');
+  }
+
+  function openSettings() {
+    const choice = prompt(
+      'B站播放器增强工具箱设置\n\n1. 启动提示\n2. 弹幕默认状态\n3. 字幕默认状态\n\n请输入 1、2 或 3：'
+    );
+    if (choice === null) return;
+    const actions = {
+      1: configureStartupNotice,
+      2: configureDanmakuDefault,
+      3: configureSubtitleDefault
+    };
+    const action = actions[choice.trim()];
+    if (action) action();
+    else showNotice('设置：输入无效，未作修改');
   }
 
   function formatTime(sec) {
@@ -363,8 +756,8 @@
     document.querySelectorAll('video[data-bili-skip-bound="true"]').forEach((video) => {
       video.dataset.biliSkipTail = '';
     });
-    shadowHostObservers.forEach((entry) => {
-      entry.host.shadowRoot?.querySelectorAll('video[data-bili-skip-bound="true"]').forEach((video) => {
+    shadowHostObservers.forEach(({ host, root }) => {
+      (root || host.shadowRoot)?.querySelectorAll('video[data-bili-skip-bound="true"]').forEach((video) => {
         video.dataset.biliSkipTail = '';
       });
     });
@@ -386,9 +779,9 @@
       enabled = true;
     }
 
-    localStorage.setItem(KEY_HEAD, headSec === null ? '' : headSec);
-    localStorage.setItem(KEY_TAIL, tailSec === null ? '' : tailSec);
-    localStorage.setItem(KEY_ENABLED, enabled);
+    setStoredValue(KEY_HEAD, headSec === null ? '' : headSec);
+    setStoredValue(KEY_TAIL, tailSec === null ? '' : tailSec);
+    setStoredValue(KEY_ENABLED, enabled);
 
     clearTailSkipMarkers();
 
@@ -408,6 +801,18 @@
       }
     }
     return null;
+  }
+
+  function findControlInEvent(event, selector) {
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    for (const node of path) {
+      if (!(node instanceof Element)) continue;
+      const match = node.closest(selector);
+      if (match) return match;
+    }
+    return event.target instanceof Element
+      ? closestCrossShadow(event.target, selector)
+      : null;
   }
 
   function handleVideoTimeUpdate(video) {
@@ -497,6 +902,7 @@
     const entry = shadowHostObservers.get(host);
     if (!entry) return;
     entry.observer.disconnect();
+    entry.root.removeEventListener('click', handleManualPlayerControlClick, true);
     shadowHostObservers.delete(host);
   }
 
@@ -535,49 +941,115 @@
     });
   }
 
-  function observeShadowHost(host) {
-    if (!host || !host.shadowRoot || shadowHostObservers.has(host)) return;
+  function observeShadowHost(host, root = host?.shadowRoot) {
+    if (!host || !root || shadowHostObservers.has(host)) return;
     const observer = new MutationObserver((mutations) => {
       cleanupShadowHostObservers();
       const addedNodes = [];
       mutations.forEach((mutation) => {
-        mutation.removedNodes.forEach(disconnectShadowHostsInSubtree);
-        mutation.addedNodes.forEach((node) => addedNodes.push(node));
+        mutation.removedNodes?.forEach(disconnectShadowHostsInSubtree);
+        mutation.addedNodes?.forEach((node) => addedNodes.push(node));
       });
       scanAddedNodes(addedNodes);
+      if (addedNodes.some(mayContainPlayerEnhancement)) {
+        schedulePlayerEnhancementUpdate();
+        startPlaylistPositionRetries();
+      }
+      if (mutations.some(isDefaultPreferenceStateMutation)) {
+        schedulePlayerEnhancementUpdate();
+      }
+      if (addedNodes.some(mayContainDefaultPreferenceControl)) {
+        startDefaultPreferenceRetries();
+      }
     });
-    observer.observe(host.shadowRoot, { childList: true, subtree: true });
-    shadowHostObservers.set(host, { observer, host });
-    scanSubtree(host.shadowRoot);
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['aria-checked', 'checked', 'class']
+    });
+    root.addEventListener('click', handleManualPlayerControlClick, true);
+    shadowHostObservers.set(host, { observer, host, root });
+    scanSubtree(root);
+    if (root.querySelector(PLAYER_ENHANCEMENT_SELECTOR)) {
+      schedulePlayerEnhancementUpdate();
+      startPlaylistPositionRetries();
+    }
+    if (root.querySelector(DEFAULT_PREFERENCE_SELECTOR)) {
+      startDefaultPreferenceRetries();
+    }
   }
 
   const originalAttachShadow = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function (init) {
     const shadowRoot = originalAttachShadow.call(this, init);
-    observeShadowHost(this);
+    observeShadowHost(this, shadowRoot);
     return shadowRoot;
   };
 
   const documentObserver = new MutationObserver((mutations) => {
+    handlePlaybackNavigation();
     cleanupShadowHostObservers();
     const addedNodes = [];
     mutations.forEach((mutation) => {
-      mutation.removedNodes.forEach(disconnectShadowHostsInSubtree);
-      mutation.addedNodes.forEach((node) => addedNodes.push(node));
+      mutation.removedNodes?.forEach(disconnectShadowHostsInSubtree);
+      mutation.addedNodes?.forEach((node) => addedNodes.push(node));
     });
     scanAddedNodes(addedNodes);
     if (addedNodes.some(mayContainPlayerEnhancement)) {
       schedulePlayerEnhancementUpdate();
       startPlaylistPositionRetries();
     }
+    if (mutations.some(isDefaultPreferenceStateMutation)) {
+      schedulePlayerEnhancementUpdate();
+    }
+    if (addedNodes.some(mayContainDefaultPreferenceControl)) {
+      startDefaultPreferenceRetries();
+    }
   });
+
+  function handlePlaybackNavigation() {
+    const playbackKey = getPlaybackKey();
+    if (playbackKey === observedPlaybackKey) return;
+
+    observedPlaybackKey = playbackKey;
+    cancelSubtitleCloseConfirmation();
+    const { renderedSubtitles } = getChineseSubtitleControls();
+    resetSubtitleCloseAttempts(
+      playbackKey, getRenderedSubtitleSignature(renderedSubtitles)
+    );
+    danmakuUserOverrideKey = null;
+    subtitleUserOverrideKey = null;
+    restoredSubtitleControls = new WeakSet();
+    startDefaultPreferenceRetries();
+    startPlaylistPositionRetries(true);
+    if (startupNoticeMode === STARTUP_NOTICE_VIDEO) showInfo();
+  }
+
+  for (const method of ['pushState', 'replaceState']) {
+    const original = history[method];
+    history[method] = function (...args) {
+      const result = original.apply(this, args);
+      handlePlaybackNavigation();
+      return result;
+    };
+  }
+  window.addEventListener('popstate', handlePlaybackNavigation);
 
   function startObservers() {
     scanSubtree(document);
     updatePlayerEnhancements();
+    startDefaultPreferenceRetries();
     startPlaylistPositionRetries(true);
     if (document.documentElement) {
-      documentObserver.observe(document.documentElement, { childList: true, subtree: true });
+      documentObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['aria-checked', 'checked', 'class']
+      });
     }
   }
 
@@ -590,27 +1062,11 @@
     document.addEventListener('DOMContentLoaded', startObservers, { once: true });
   }
 
-  function findDanmakuSwitch() {
-    const roots = [document];
-    shadowHostObservers.forEach(({ host }) => {
-      if (host.isConnected && host.shadowRoot) roots.push(host.shadowRoot);
-    });
-    for (const root of roots) {
-      for (const control of root.querySelectorAll('.bpx-player-dm-switch')) {
-        const input = control.querySelector('input[type="checkbox"]');
-        if (input && !input.disabled && control.getClientRects().length) return control;
-      }
-    }
-    return null;
-  }
-
   function toggleDanmaku(control) {
     const input = control.querySelector('input[type="checkbox"]');
     input.click();
     // 新版原生循环为开启 → 精简 → 关闭；旧版两档开关无需额外点击。
-    if (input.getAttribute('aria-checked') === 'mixed') {
-      input.click();
-    }
+    skipSimplifiedDanmakuState(input);
   }
 
   document.addEventListener('keydown', e => {
@@ -630,7 +1086,10 @@
       if (!control) return;
       e.preventDefault();
       e.stopImmediatePropagation();
-      if (!e.repeat) toggleDanmaku(control);
+      if (!e.repeat) {
+        danmakuUserOverrideKey = getPlaybackKey();
+        toggleDanmaku(control);
+      }
       return;
     }
     if (e.repeat) return;
@@ -641,12 +1100,19 @@
       setTimes();
     }
 
+    if (e.code === 'KeyO' && e.shiftKey && !hasModifier) {
+      e.preventDefault();
+      e.stopPropagation();
+      openSettings();
+      return;
+    }
+
     // 只在纯按 'o' 时触发，如果是 Shift+O 等也排除掉
     if (e.key.toLowerCase() === 'o' && !e.shiftKey && !hasModifier) {
       e.preventDefault();
       e.stopPropagation();
       enabled = !enabled;
-      localStorage.setItem(KEY_ENABLED, enabled);
+      setStoredValue(KEY_ENABLED, enabled);
       showInfo();
     }
 
@@ -657,5 +1123,5 @@
     }
   }, true); // ★ 挂载在捕获阶段，第一时间拦截用户的按键动作
 
-  showInfo();
+  if (startupNoticeMode === STARTUP_NOTICE_VIDEO) showInfo();
 })();
