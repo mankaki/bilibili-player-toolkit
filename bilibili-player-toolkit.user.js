@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站播放器增强工具箱
 // @namespace    https://www.bilibili.com/
-// @version      3.2.0
+// @version      3.2.1
 // @description  自动跳片头片尾、选集显示 P 序号、C 键切换中文字幕、D 键切换弹幕开关，并优先使用新版画中画
 // @author       mankaki (modified)
 // @match        *://www.bilibili.com/video/*
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const TOOLKIT_VERSION = '3.2.0';
+  const TOOLKIT_VERSION = '3.2.1';
   const KEY_HEAD = 'bili_skip_head';
   const KEY_TAIL = 'bili_skip_tail';
   const KEY_ENABLED = 'bili_skip_enabled';
@@ -76,6 +76,8 @@
     : storedSubtitlePreference === 'true';
   let restoredSubtitleControls = new WeakSet();
   let observedPlaybackKey = getPlaybackKey();
+  let inheritedDanmakuEnabled = false;
+  let inheritedSubtitleEnabled = false;
   let danmakuUserOverrideKey = null;
   let subtitleUserOverrideKey = null;
   const handledManualControlEvents = new WeakSet();
@@ -240,6 +242,22 @@
     if (input.getAttribute('aria-checked') === 'mixed') input.click();
   }
 
+  function isDanmakuEnabled(input) {
+    const state = input.getAttribute('aria-checked');
+    return state === 'true' || (state === null && input.checked);
+  }
+
+  function applyDanmakuState(control, enabled) {
+    const input = control.querySelector('input[type="checkbox"]');
+    if (enabled) {
+      if (isDanmakuEnabled(input)) return;
+      skipSimplifiedDanmakuState(input);
+      input.click();
+      return;
+    }
+    closeDanmaku(control);
+  }
+
   function applyDefaultDanmakuPreference() {
     if (danmakuDefaultMode !== MODE_CLOSED) return;
 
@@ -249,7 +267,7 @@
     const control = findDanmakuSwitch();
     if (!control) return;
 
-    closeDanmaku(control);
+    applyDanmakuState(control, inheritedDanmakuEnabled);
   }
 
   const CURRENT_PLAYLIST_ITEM_SELECTOR = [
@@ -525,6 +543,15 @@
     const { closeSwitch, renderedSubtitles } = getChineseSubtitleControls();
     if (!closeSwitch) return;
 
+    if (inheritedSubtitleEnabled) {
+      cancelSubtitleCloseConfirmation(playbackKey);
+      const { chinese } = getChineseSubtitleControls();
+      const isClosed = closeSwitch.classList.contains('bpx-state-active');
+      const isChineseActive = chinese?.classList.contains('bpx-state-active');
+      if (chinese && (isClosed || !isChineseActive)) chinese.click();
+      return;
+    }
+
     const isClosed = closeSwitch.classList.contains('bpx-state-active');
     const renderedSignature = getRenderedSubtitleSignature(renderedSubtitles);
     const isRendered = renderedSignature !== '';
@@ -557,8 +584,10 @@
     if (!closeSwitch) return;
 
     subtitleEnabled = !closeSwitch.classList.contains('bpx-state-active');
+    inheritedSubtitleEnabled = subtitleEnabled;
     setStoredValue(KEY_SUBTITLE_ENABLED, subtitleEnabled);
     restoredSubtitleControls.add(closeSwitch);
+    showNotice(subtitleEnabled ? '字幕已开启' : '字幕已关闭');
   }
 
   function toggleChineseSubtitle() {
@@ -569,6 +598,7 @@
     const isClosed = closeSwitch.classList.contains('bpx-state-active');
     const isChineseActive = chinese.classList.contains('bpx-state-active');
     subtitleEnabled = !(isChineseActive && !isClosed);
+    inheritedSubtitleEnabled = subtitleEnabled;
     setStoredValue(KEY_SUBTITLE_ENABLED, subtitleEnabled);
     restoredSubtitleControls.add(closeSwitch);
     subtitleUserOverrideKey = getPlaybackKey();
@@ -578,6 +608,7 @@
     } else {
       closeSwitch.click();
     }
+    showNotice(subtitleEnabled ? '字幕已开启' : '字幕已关闭');
   }
 
   function handleManualPlayerControlClick(event) {
@@ -586,9 +617,7 @@
     const subtitleControl = findControlInEvent(event,
       '.bpx-player-ctrl-subtitle-language-item, .bpx-player-ctrl-subtitle-close-switch'
     );
-    const danmakuControl = danmakuDefaultMode === MODE_CLOSED
-      ? findControlInEvent(event, '.bpx-player-dm-switch')
-      : null;
+    const danmakuControl = findControlInEvent(event, '.bpx-player-dm-switch');
     if (!subtitleControl && !danmakuControl) return;
 
     handledManualControlEvents.add(event);
@@ -602,11 +631,19 @@
     const input = danmakuControl?.querySelector('input[type="checkbox"]');
     if (!input) return;
 
-    danmakuUserOverrideKey = getPlaybackKey();
+    if (danmakuDefaultMode === MODE_CLOSED) {
+      danmakuUserOverrideKey = getPlaybackKey();
+    }
 
     // 原生按钮从关闭状态开启后应停在“全部弹幕”，不保留“精简弹幕”。
     setTimeout(() => {
-      skipSimplifiedDanmakuState(input);
+      if (danmakuDefaultMode === MODE_CLOSED) {
+        skipSimplifiedDanmakuState(input);
+        inheritedDanmakuEnabled = isDanmakuEnabled(input);
+      }
+      const state = input.getAttribute('aria-checked');
+      const enabled = state === null ? input.checked : state !== 'false';
+      showNotice(enabled ? '弹幕已开启' : '弹幕已关闭');
     }, 0);
   }
 
@@ -689,33 +726,35 @@
 
   function configureDanmakuDefault() {
     const closeByDefault = selectSetting(
-      '弹幕默认状态', '不处理（保持 B 站状态）', '打开视频时默认关闭',
+      '弹幕默认状态', '不处理（保持 B 站状态）', '新打开视频时默认关闭，页内切换继承当前状态',
       danmakuDefaultMode === MODE_CLOSED
     );
     if (closeByDefault === null) return;
     const nextMode = closeByDefault ? MODE_CLOSED : MODE_UNCHANGED;
     if (!writeSetting(KEY_DANMAKU_DEFAULT, nextMode)) return;
     danmakuDefaultMode = nextMode;
+    inheritedDanmakuEnabled = false;
     danmakuUserOverrideKey = null;
     startDefaultPreferenceRetries();
-    showNotice(closeByDefault ? '弹幕：打开视频时默认关闭' : '弹幕：不处理');
+    showNotice(closeByDefault ? '弹幕：新打开视频时默认关闭，页内切换继承' : '弹幕：不处理');
   }
 
   function configureSubtitleDefault() {
     const closeByDefault = selectSetting(
-      '字幕默认状态', '不处理（保持原有字幕记忆行为）', '打开视频时默认关闭',
+      '字幕默认状态', '不处理（保持原有字幕记忆行为）', '新打开视频时默认关闭，页内切换继承当前状态',
       subtitleDefaultMode === MODE_CLOSED
     );
     if (closeByDefault === null) return;
     const nextMode = closeByDefault ? MODE_CLOSED : MODE_UNCHANGED;
     if (!writeSetting(KEY_SUBTITLE_DEFAULT, nextMode)) return;
     subtitleDefaultMode = nextMode;
+    inheritedSubtitleEnabled = false;
     subtitleUserOverrideKey = null;
     restoredSubtitleControls = new WeakSet();
     cancelSubtitleCloseConfirmation();
     resetSubtitleCloseAttempts();
     startDefaultPreferenceRetries();
-    showNotice(closeByDefault ? '字幕：打开视频时默认关闭' : '字幕：不处理');
+    showNotice(closeByDefault ? '字幕：新打开视频时默认关闭，页内切换继承' : '字幕：不处理');
   }
 
   function openSettings() {
@@ -1067,6 +1106,8 @@
     input.click();
     // 新版原生循环为开启 → 精简 → 关闭；旧版两档开关无需额外点击。
     skipSimplifiedDanmakuState(input);
+    inheritedDanmakuEnabled = isDanmakuEnabled(input);
+    showNotice(inheritedDanmakuEnabled ? '弹幕已开启' : '弹幕已关闭');
   }
 
   document.addEventListener('keydown', e => {

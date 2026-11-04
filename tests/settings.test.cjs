@@ -109,6 +109,8 @@ test('Shift+O settings entry persists all three choices', () => {
     let startupNoticeMode = STARTUP_NOTICE_SHORTCUTS;
     let danmakuDefaultMode = MODE_UNCHANGED;
     let subtitleDefaultMode = MODE_UNCHANGED;
+    let inheritedDanmakuEnabled = false;
+    let inheritedSubtitleEnabled = false;
     let danmakuUserOverrideKey = null;
     let subtitleUserOverrideKey = null;
     let restoredSubtitleControls = new WeakSet();
@@ -178,6 +180,7 @@ test('default-close survives a continuously visible subtitle layer reused by the
     const STARTUP_NOTICE_VIDEO = 'video';
     let startupNoticeMode = 'shortcuts';
     let subtitleDefaultMode = MODE_CLOSED;
+    let inheritedSubtitleEnabled = false;
     let observedPlaybackKey = getPlaybackKey();
     let danmakuUserOverrideKey = null;
     let subtitleUserOverrideKey = observedPlaybackKey;
@@ -272,12 +275,86 @@ test('subtitle unchanged mode preserves the existing restore behavior', () => {
   vm.runInNewContext(`
     const MODE_CLOSED = 'closed';
     let subtitleDefaultMode = 'unchanged';
+    let inheritedSubtitleEnabled = false;
     let subtitleUserOverrideKey = null;
     ${extractFunction('getPlaybackKey')}
     ${extractFunction('applySubtitlePreference')}
     applySubtitlePreference();
   `, context);
   assert.equal(restores, 1);
+});
+
+test('enabled subtitles are restored after an in-page playback change', () => {
+  let closed = true;
+  let chineseActive = false;
+  let clicks = 0;
+  const chinese = {
+    classList: { contains: () => chineseActive },
+    click() {
+      clicks++;
+      closed = false;
+      chineseActive = true;
+    }
+  };
+  const closeSwitch = { classList: { contains: () => closed } };
+  const context = {
+    URL,
+    location: { href: 'https://www.bilibili.com/video/BV2' },
+    getChineseSubtitleControls: () => ({ chinese, closeSwitch, renderedSubtitles: [] }),
+    cancelSubtitleCloseConfirmation() {},
+    restoreChineseSubtitlePreference() {}
+  };
+  vm.runInNewContext(`
+    const MODE_CLOSED = 'closed';
+    let subtitleDefaultMode = MODE_CLOSED;
+    let inheritedSubtitleEnabled = true;
+    let subtitleUserOverrideKey = null;
+    ${extractFunction('getPlaybackKey')}
+    ${extractFunction('applySubtitlePreference')}
+    applySubtitlePreference();
+  `, context);
+
+  assert.equal(clicks, 1);
+  assert.equal(closed, false);
+  assert.equal(chineseActive, true);
+});
+
+test('C always reports the resulting subtitle state', () => {
+  let closed = true;
+  let chineseActive = false;
+  const notices = [];
+  const chinese = {
+    classList: { contains: () => chineseActive },
+    click() {
+      closed = false;
+      chineseActive = true;
+    }
+  };
+  const closeSwitch = {
+    classList: { contains: () => closed },
+    click() { closed = true; }
+  };
+  const context = {
+    URL,
+    location: { href: 'https://www.bilibili.com/video/BV1' },
+    getChineseSubtitleControls: () => ({ chinese, closeSwitch }),
+    setStoredValue() {},
+    showNotice: (message) => notices.push(message),
+    WeakSet
+  };
+  vm.runInNewContext(`
+    const KEY_SUBTITLE_ENABLED = 'subtitle-enabled';
+    let subtitleEnabled = null;
+    let inheritedSubtitleEnabled = false;
+    let subtitleUserOverrideKey = null;
+    let restoredSubtitleControls = new WeakSet();
+    ${extractFunction('getPlaybackKey')}
+    ${extractFunction('toggleChineseSubtitle')}
+    toggleChineseSubtitle();
+    toggleChineseSubtitle();
+  `, context);
+
+  assert.deepEqual(notices, ['字幕已开启', '字幕已关闭']);
 });
 
 test('navigation ignores incidental URL changes but resets overrides for a new part', () => {

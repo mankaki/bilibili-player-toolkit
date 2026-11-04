@@ -16,6 +16,7 @@ const toggleSource = source.slice(source.indexOf('  function toggleDanmaku('), k
 const keyboardSource = `
   const MODE_CLOSED = 'closed';
   let danmakuDefaultMode = MODE_CLOSED;
+  let inheritedDanmakuEnabled = false;
   let danmakuUserOverrideKey = null;
   ${danmakuFunctions}
   ${toggleSource}
@@ -27,6 +28,7 @@ function setup(initial = 'true', { legacy = false, shadow = false, missing = fal
   let state = initial;
   let clicks = 0;
   let listener;
+  const notices = [];
   const input = {
     disabled: false,
     getAttribute: () => state,
@@ -58,7 +60,8 @@ function setup(initial = 'true', { legacy = false, shadow = false, missing = fal
     setTimes() {},
     localStorage: { setItem() {} },
     enabled: false,
-    showInfo() {}
+    showInfo() {},
+    showNotice: (message) => notices.push(message)
   };
   vm.runInNewContext(keyboardSource, context);
   function press(overrides = {}) {
@@ -76,7 +79,8 @@ function setup(initial = 'true', { legacy = false, shadow = false, missing = fal
     close: () => context.testApi.closeDanmaku(control),
     applyDefault: () => context.testApi.applyDefaultDanmakuPreference(),
     restoreState: (value) => { state = value; },
-    navigate: (href) => { context.location.href = href; }
+    navigate: (href) => { context.location.href = href; },
+    notices
   };
 }
 
@@ -116,17 +120,15 @@ test('default-close corrects delayed player restoration on initial load and afte
   assert.equal(player.clicks(), 3);
 });
 
-test('manual danmaku choice is preserved until SPA navigation', () => {
+test('manual danmaku choice is inherited after SPA navigation', () => {
   const player = setup('false');
   player.press();
   assert.equal(player.state(), 'true');
 
+  player.navigate('https://www.bilibili.com/video/BV2');
+  player.restoreState('false');
   player.applyDefault();
   assert.equal(player.state(), 'true');
-
-  player.navigate('https://www.bilibili.com/video/BV2');
-  player.applyDefault();
-  assert.equal(player.state(), 'false');
 });
 
 test('manual danmaku choice survives unrelated URL changes on the same video', () => {
@@ -137,15 +139,32 @@ test('manual danmaku choice survives unrelated URL changes on the same video', (
   assert.equal(player.state(), 'true');
 
   player.navigate('https://www.bilibili.com/video/BV1?p=2');
+  player.restoreState('false');
+  player.applyDefault();
+  assert.equal(player.state(), 'true');
+});
+
+test('manually disabled danmaku remains disabled after SPA navigation', () => {
+  const player = setup('false');
+  player.press();
+  player.press();
+  assert.equal(player.state(), 'false');
+
+  player.navigate('https://www.bilibili.com/video/BV2');
+  player.restoreState('true');
   player.applyDefault();
   assert.equal(player.state(), 'false');
 });
 
 test('D alternates fully on/off without stopping at simplified', () => {
   const player = setup();
-  for (const expected of ['false', 'true', 'false', 'true']) {
+  for (const [expected, notice] of [
+    ['false', '弹幕已关闭'], ['true', '弹幕已开启'],
+    ['false', '弹幕已关闭'], ['true', '弹幕已开启']
+  ]) {
     const event = player.press();
     assert.equal(player.state(), expected);
+    assert.equal(player.notices.at(-1), notice);
     assert.equal(event.prevented, true);
     assert.equal(event.stopped, true);
   }
