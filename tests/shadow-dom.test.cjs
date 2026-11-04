@@ -100,9 +100,10 @@ test('controls added later to a shadow root schedule the default-state update', 
     'updating an existing subtitle text node schedules another state check');
 });
 
-test('default-state retries cover delayed initial and SPA restoration with a finite schedule', () => {
+test('initial state notice starts after the first default-state pass, not the 7-second retry', () => {
   const timers = [];
   let scheduled = 0;
+  let shown = 0;
   const context = {
     clearTimeout() {},
     setTimeout(callback, delay) {
@@ -110,7 +111,7 @@ test('default-state retries cover delayed initial and SPA restoration with a fin
       return delay;
     },
     schedulePlayerEnhancementUpdate: () => scheduled++,
-    showInitialPlayerStateNotices() {}
+    showInitialPlayerStateNotices() { shown++; }
   };
   vm.runInNewContext(`
     let defaultPreferenceRetryTimers = [];
@@ -120,14 +121,18 @@ test('default-state retries cover delayed initial and SPA restoration with a fin
 
   context.start();
   assert.deepEqual(timers.map(({ delay }) => delay), [0, 100, 250, 500, 1000, 2000, 4000, 7000]);
+  timers[0].callback();
+  assert.equal(scheduled, 1, 'the default preference is applied before reporting state');
+  assert.equal(timers.at(-1).delay, 100, 'initial state is reported shortly after the first update');
   timers.at(-1).callback();
-  assert.equal(scheduled, 1, 'initial page still checks a state restored after one second');
-  assert.equal(timers.at(-1).delay, 100, 'initial state is reported after the final update');
+  assert.equal(shown, 1, 'initial state is reported without waiting for the late retry window');
+  timers[7].callback();
+  assert.equal(timers.length, 9, 'the 7-second retry does not schedule another initial notice');
 
   timers.length = 0;
   context.start();
-  timers.at(-1).callback();
-  assert.equal(scheduled, 2, 'SPA navigation starts the same bounded late-state check');
+  timers[0].callback();
+  assert.equal(scheduled, 3, 'SPA navigation starts the same bounded late-state check');
   assert.equal(timers.length, 9, 'retry schedule and the final state report remain bounded');
 });
 

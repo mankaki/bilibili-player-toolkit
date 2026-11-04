@@ -109,8 +109,7 @@
   let defaultPreferenceRetryTimers = [];
   let initialDanmakuStateNoticeShown = false;
   let initialSubtitleStateNoticeShown = false;
-  let initialSubtitleStateNoticeTimer = null;
-  let initialSubtitleStateNoticeKey = null;
+  let initialPlayerStateNoticeVisible = false;
   let initialPlayerStateNoticeRetryTimer = null;
   let initialPlayerStateNoticeKey = observedPlaybackKey;
   let initialPlayerStateNoticeRetryAttempts = 0;
@@ -434,7 +433,7 @@
     [0, 100, 250, 500, 1000, 2000, 4000, 7000].forEach((delay) => {
       defaultPreferenceRetryTimers.push(setTimeout(() => {
         schedulePlayerEnhancementUpdate();
-        if (delay === 7000) {
+        if (delay === 0) {
           defaultPreferenceRetryTimers.push(setTimeout(showInitialPlayerStateNotices, 100));
         }
       }, delay));
@@ -446,50 +445,60 @@
     if (initialPlayerStateNoticeKey !== playbackKey) return;
     if (initialDanmakuStateNoticeShown && initialSubtitleStateNoticeShown) return;
 
-    if (subtitleCloseConfirmationTimer !== null) {
-      scheduleInitialPlayerStateNoticeRetry(playbackKey);
-      return;
-    }
+    const pendingNotices = [];
 
     if (!initialDanmakuStateNoticeShown) {
       const danmakuControl = findDanmakuSwitch();
       if (danmakuControl) {
         const danmakuInput = danmakuControl.querySelector('input[type="checkbox"]');
-        showNotice(isDanmakuEnabled(danmakuInput) ? '弹幕已开启' : '弹幕已关闭');
-        initialDanmakuStateNoticeShown = true;
+        pendingNotices.push({
+          type: 'danmaku',
+          message: isDanmakuEnabled(danmakuInput) ? '弹幕已开启' : '弹幕已关闭'
+        });
       }
     }
 
-    if (!initialSubtitleStateNoticeShown && initialSubtitleStateNoticeTimer === null) {
+    // 默认关闭字幕时先等待现有的 500ms 确认完成，避免报告播放器恢复前的旧状态。
+    if (!initialSubtitleStateNoticeShown && subtitleCloseConfirmationTimer === null) {
       const { chinese, closeSwitch } = getChineseSubtitleControls();
       if (chinese && closeSwitch) {
-        initialSubtitleStateNoticeKey = playbackKey;
-        initialSubtitleStateNoticeTimer = setTimeout(() => {
-          initialSubtitleStateNoticeTimer = null;
-          if (initialSubtitleStateNoticeKey !== playbackKey
-            || getPlaybackKey() !== playbackKey) {
-            initialSubtitleStateNoticeKey = null;
-            return;
-          }
-          initialSubtitleStateNoticeKey = null;
-
-          const currentControls = getChineseSubtitleControls();
-          if (!currentControls.chinese || !currentControls.closeSwitch) {
-            scheduleInitialPlayerStateNoticeRetry(playbackKey);
-            return;
-          }
-          showNotice(currentControls.closeSwitch.classList.contains('bpx-state-active')
+        pendingNotices.push({
+          type: 'subtitle',
+          message: closeSwitch.classList.contains('bpx-state-active')
             ? '字幕已关闭'
-            : '字幕已开启');
-          initialSubtitleStateNoticeShown = true;
-        }, 3000);
+            : '字幕已开启'
+        });
       }
     }
 
-    if (!initialDanmakuStateNoticeShown
-      || (!initialSubtitleStateNoticeShown && initialSubtitleStateNoticeTimer === null)) {
+    const scriptNotices = pendingNotices.filter(({ type, message }) => {
+      if (!hasMatchingNativeNotice(message)) return true;
+      if (type === 'danmaku') initialDanmakuStateNoticeShown = true;
+      else initialSubtitleStateNoticeShown = true;
+      return false;
+    });
+    if (scriptNotices.length) {
+      showInitialPlayerStateNotice(scriptNotices.map(({ message }) => message));
+      scriptNotices.forEach(({ type }) => {
+        if (type === 'danmaku') initialDanmakuStateNoticeShown = true;
+        else initialSubtitleStateNoticeShown = true;
+      });
+    }
+
+    if (!initialDanmakuStateNoticeShown || !initialSubtitleStateNoticeShown) {
       scheduleInitialPlayerStateNoticeRetry(playbackKey);
     }
+  }
+
+  function showInitialPlayerStateNotice(messages) {
+    const visibleMessages = initialPlayerStateNoticeVisible
+      && infoDiv.style.opacity === '1'
+      && isPlayerStateNotice(infoDiv.textContent)
+      ? infoDiv.textContent.split(' · ')
+      : [];
+    const mergedMessages = [...new Set([...visibleMessages, ...messages])];
+    initialPlayerStateNoticeVisible = true;
+    showNotice(mergedMessages.join(' · '), true);
   }
 
   function scheduleInitialPlayerStateNoticeRetry(playbackKey) {
@@ -511,11 +520,7 @@
     }
     initialPlayerStateNoticeRetryTimer = null;
     initialPlayerStateNoticeKey = null;
-    if (initialSubtitleStateNoticeTimer !== null) {
-      clearTimeout(initialSubtitleStateNoticeTimer);
-    }
-    initialSubtitleStateNoticeTimer = null;
-    initialSubtitleStateNoticeKey = null;
+    initialPlayerStateNoticeVisible = false;
   }
 
   function getChineseSubtitleControls() {
@@ -809,6 +814,32 @@
     });
   }
 
+  function hasNativePlayerStateNotice() {
+    return ['字幕已开启', '字幕已关闭', '弹幕已开启', '弹幕已关闭']
+      .some(hasMatchingNativeNotice);
+  }
+
+  function isPlayerStateNotice(message) {
+    return /^(?:字幕|弹幕)已(?:开启|关闭)(?: · (?:字幕|弹幕)已(?:开启|关闭))*$/.test(message);
+  }
+
+  function getUncoveredPlayerStateNotice(message) {
+    if (!isPlayerStateNotice(message)) return { message, covered: false };
+
+    const items = message.split(' · ');
+    const remainingItems = items.filter((item) => !hasMatchingNativeNotice(item));
+    return {
+      message: remainingItems.join(' · '),
+      covered: remainingItems.length !== items.length
+    };
+  }
+
+  function positionNoticeAboveNativeNotice(aboveNativeNotice) {
+    if (infoDiv.style.position === 'absolute') {
+      infoDiv.style.bottom = aboveNativeNotice ? '108px' : '60px';
+    }
+  }
+
   function ensureInfoDivMounted() {
     const playerContainer = findNoticeContainer();
     const targetContainer = playerContainer || getOverlayContainer();
@@ -839,9 +870,21 @@
   }
 
   function hideNoticeIfNativeAppears(message) {
-    if (!hasMatchingNativeNotice(message)) return false;
+    const displayedMessage = isPlayerStateNotice(infoDiv.textContent)
+      ? infoDiv.textContent
+      : message;
+    const uncoveredNotice = getUncoveredPlayerStateNotice(displayedMessage);
+    const hasNativeNotice = hasNativePlayerStateNotice();
+    positionNoticeAboveNativeNotice(hasNativeNotice);
+    if (!uncoveredNotice.covered) return false;
+
+    if (uncoveredNotice.message) {
+      infoDiv.textContent = uncoveredNotice.message;
+      return false;
+    }
 
     infoDiv.style.opacity = '0';
+    initialPlayerStateNoticeVisible = false;
     if (hideTimer) clearTimeout(hideTimer);
     hideTimer = null;
     stopWatchingForNativeNotice();
@@ -860,7 +903,7 @@
       childList: true, subtree: true, characterData: true, attributes: true
     });
 
-    if (/^(字幕|弹幕)已(开启|关闭)$/.test(message)) {
+    if (isPlayerStateNotice(message)) {
       const recheckVisibility = () => {
         nativeNoticeVisibilityTimer = null;
         if (infoDiv.style.opacity !== '1' || hideNoticeIfNativeAppears(message)) return;
@@ -870,17 +913,20 @@
     }
   }
 
-  function showNotice(message) {
+  function showNotice(message, preserveInitialPlayerStateNotice = false) {
     stopWatchingForNativeNotice();
+    if (!preserveInitialPlayerStateNotice) initialPlayerStateNoticeVisible = false;
+    infoDiv.textContent = message;
     if (hideNoticeIfNativeAppears(message)) return;
 
     ensureInfoDivMounted();
-    infoDiv.textContent = message;
+    positionNoticeAboveNativeNotice(hasNativePlayerStateNotice());
     infoDiv.style.opacity = '1';
 
     if (hideTimer) clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {
       infoDiv.style.opacity = '0';
+      initialPlayerStateNoticeVisible = false;
       hideTimer = null;
       if (nativeNoticeVisibilityTimer !== null) {
         clearTimeout(nativeNoticeVisibilityTimer);
@@ -888,7 +934,7 @@
       }
       nativeNoticeStopTimer = setTimeout(stopWatchingForNativeNotice, 500);
     }, 3000);
-    watchForNativeNotice(message);
+    watchForNativeNotice(infoDiv.textContent);
   }
 
   function showInfo() {

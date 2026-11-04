@@ -88,6 +88,7 @@ test('startup notice is hidden by default and available in video mode', () => {
 function setupInitialStateNotices() {
   const notices = [];
   const timers = [];
+  const infoDiv = { style: { opacity: '0' }, textContent: '' };
   let playbackKey = 'video:bv1|p=1';
   let danmakuControl = null;
   let subtitleControls = { chinese: null, closeSwitch: null };
@@ -95,7 +96,13 @@ function setupInitialStateNotices() {
     findDanmakuSwitch: () => danmakuControl,
     getChineseSubtitleControls: () => subtitleControls,
     getPlaybackKey: () => playbackKey,
-    showNotice: (message) => notices.push(message),
+    hasMatchingNativeNotice: () => false,
+    infoDiv,
+    showNotice(message) {
+      infoDiv.textContent = message;
+      infoDiv.style.opacity = '1';
+      notices.push(message);
+    },
     setTimeout(callback, delay) {
       const timer = { callback, delay, cancelled: false };
       timers.push(timer);
@@ -106,13 +113,14 @@ function setupInitialStateNotices() {
   vm.runInNewContext(`
     let initialDanmakuStateNoticeShown = false;
     let initialSubtitleStateNoticeShown = false;
-    let initialSubtitleStateNoticeTimer = null;
-    let initialSubtitleStateNoticeKey = null;
+    let initialPlayerStateNoticeVisible = false;
     let initialPlayerStateNoticeRetryTimer = null;
     let initialPlayerStateNoticeKey = getPlaybackKey();
     let initialPlayerStateNoticeRetryAttempts = 0;
     let subtitleCloseConfirmationTimer = null;
     ${extractFunction('isDanmakuEnabled')}
+    ${extractFunction('isPlayerStateNotice')}
+    ${extractFunction('showInitialPlayerStateNotice')}
     ${extractFunction('showInitialPlayerStateNotices')}
     ${extractFunction('scheduleInitialPlayerStateNoticeRetry')}
     ${extractFunction('cancelInitialPlayerStateNotices')}
@@ -127,7 +135,7 @@ function setupInitialStateNotices() {
   };
 }
 
-test('initial danmaku notice keeps a bounded retry after the final startup check', () => {
+test('initial danmaku notice keeps a bounded retry while waiting for its control', () => {
   const harness = setupInitialStateNotices();
   harness.context.schedule();
 
@@ -145,26 +153,54 @@ test('initial danmaku notice keeps a bounded retry after the final startup check
   assert.equal(harness.timers.length, 30, 'retry count remains bounded');
 });
 
+test('simultaneously ready initial states are combined into one notice', () => {
+  const harness = setupInitialStateNotices();
+  harness.setDanmakuControl({
+    querySelector: () => ({ checked: false, getAttribute: () => 'false' })
+  });
+  harness.setSubtitleControls({
+    chinese: {},
+    closeSwitch: { classList: { contains: () => true } }
+  });
+
+  harness.context.schedule();
+
+  assert.deepEqual(harness.notices, ['弹幕已关闭 · 字幕已关闭']);
+  assert.equal(harness.timers.length, 0);
+});
+
+test('subtitle becoming ready on the next retry joins the visible danmaku notice', () => {
+  const harness = setupInitialStateNotices();
+  harness.setDanmakuControl({
+    querySelector: () => ({ checked: false, getAttribute: () => 'false' })
+  });
+
+  harness.context.schedule();
+  assert.deepEqual(harness.notices, ['弹幕已关闭']);
+  assert.equal(harness.timers[0].delay, 500);
+
+  harness.setSubtitleControls({
+    chinese: {},
+    closeSwitch: { classList: { contains: () => true } }
+  });
+  harness.timers[0].callback();
+
+  assert.deepEqual(harness.notices, [
+    '弹幕已关闭',
+    '弹幕已关闭 · 字幕已关闭'
+  ]);
+});
+
 test('initial subtitle notice survives a same-playback player rebuild and shows once', () => {
   const harness = setupInitialStateNotices();
   const controls = {
     chinese: {},
     closeSwitch: { classList: { contains: () => false } }
   };
-  harness.setSubtitleControls(controls);
   harness.context.schedule();
 
-  const subtitleWait = harness.timers.find(({ delay }) => delay === 3000);
-  harness.setSubtitleControls({ chinese: null, closeSwitch: null });
-  subtitleWait.callback();
-  const rebuildRetry = harness.timers.at(-1);
-  assert.equal(rebuildRetry.delay, 500);
-
   harness.setSubtitleControls(controls);
-  rebuildRetry.callback();
-  const resumedWait = harness.timers.filter(({ delay }) => delay === 3000).at(-1);
-  assert.equal(resumedWait.delay, 3000);
-  resumedWait.callback();
+  harness.timers[0].callback();
   harness.context.schedule();
 
   assert.deepEqual(harness.notices, ['字幕已开启']);
@@ -172,12 +208,8 @@ test('initial subtitle notice survives a same-playback player rebuild and shows 
 
 test('SPA playback change cancels every pending initial notice without reshowing', () => {
   const harness = setupInitialStateNotices();
-  harness.setSubtitleControls({
-    chinese: {},
-    closeSwitch: { classList: { contains: () => false } }
-  });
   harness.context.schedule();
-  assert.deepEqual(harness.timers.map(({ delay }) => delay).sort((a, b) => a - b), [500, 3000]);
+  assert.deepEqual(harness.timers.map(({ delay }) => delay), [500]);
 
   harness.setPlaybackKey('video:bv1|p=2');
   harness.context.cancel();
@@ -186,7 +218,7 @@ test('SPA playback change cancels every pending initial notice without reshowing
   harness.timers.forEach(({ callback }) => callback());
   harness.context.schedule();
   assert.deepEqual(harness.notices, []);
-  assert.equal(harness.timers.length, 2, 'new playback does not schedule initial notices');
+  assert.equal(harness.timers.length, 1, 'new playback does not schedule initial notices');
 });
 
 test('Shift+O settings entry persists all three choices', () => {

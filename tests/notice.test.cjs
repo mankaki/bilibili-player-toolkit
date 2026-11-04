@@ -71,6 +71,7 @@ function setup({ selectors = {}, fullscreenElement = null } = {}) {
     nativeNoticeObserver: null,
     nativeNoticeStopTimer: null,
     nativeNoticeVisibilityTimer: null,
+    initialPlayerStateNoticeVisible: false,
     queryPlayerElements: (selector) => selectors[selector] || [],
     setTimeout(callback, delay) {
       timers.push({ callback, delay });
@@ -82,12 +83,20 @@ function setup({ selectors = {}, fullscreenElement = null } = {}) {
     ${extractFunction('getOverlayContainer')}
     ${extractFunction('findNoticeContainer')}
     ${extractFunction('hasMatchingNativeNotice')}
+    ${extractFunction('hasNativePlayerStateNotice')}
+    ${extractFunction('isPlayerStateNotice')}
+    ${extractFunction('getUncoveredPlayerStateNotice')}
+    ${extractFunction('positionNoticeAboveNativeNotice')}
+    ${extractFunction('showInitialPlayerStateNotice')}
     ${extractFunction('ensureInfoDivMounted')}
     ${extractFunction('stopWatchingForNativeNotice')}
     ${extractFunction('hideNoticeIfNativeAppears')}
     ${extractFunction('watchForNativeNotice')}
     ${extractFunction('showNotice')}
-    this.api = { findNoticeContainer, hasMatchingNativeNotice, ensureInfoDivMounted, showNotice };
+    this.api = {
+      findNoticeContainer, hasMatchingNativeNotice, ensureInfoDivMounted,
+      showInitialPlayerStateNotice, showNotice
+    };
   `, context);
   return { ...context, fallback, timers, observers };
 }
@@ -215,6 +224,63 @@ test('script notice is removed when the matching native toast appears later', ()
   assert.equal(context.infoDiv.style.opacity, '0');
   assert.equal(context.timers[0].cancelled, true, 'the normal fade timer is cleared');
   assert.equal(context.observers[0].disconnected, true);
+});
+
+test('native subtitle toast does not shorten the initial danmaku notice', () => {
+  const videoArea = createElement();
+  const selectors = {
+    '.bpx-player-video-area': [videoArea],
+    '.bpx-player-toast-wrap': []
+  };
+  const context = setup({ selectors });
+
+  context.api.showNotice('弹幕已关闭');
+
+  const nativeToastItem = createElement({ text: '字幕 已关闭' });
+  const nativeToast = createElement();
+  nativeToast.descendants.push(nativeToastItem);
+  selectors['.bpx-player-toast-wrap'] = [nativeToast];
+  context.observers[0].trigger();
+
+  assert.equal(context.infoDiv.textContent, '弹幕已关闭');
+  assert.equal(context.infoDiv.style.opacity, '1');
+  assert.equal(context.infoDiv.style.bottom, '108px');
+  assert.equal(context.timers[0].cancelled, undefined, 'the three-second timer is preserved');
+
+  context.timers[0].callback();
+  assert.equal(context.infoDiv.style.opacity, '0');
+});
+
+test('combined player state notice only yields the matching item to a native toast', () => {
+  const videoArea = createElement();
+  const selectors = {
+    '.bpx-player-video-area': [videoArea],
+    '.bpx-player-toast-wrap': []
+  };
+  const context = setup({ selectors });
+
+  context.api.showInitialPlayerStateNotice(['弹幕已关闭']);
+  context.api.showInitialPlayerStateNotice(['字幕已关闭']);
+  assert.equal(context.timers[0].cancelled, true, 'combining restarts the three-second timer');
+  assert.equal(context.timers[2].delay, 3000);
+  assert.equal(context.infoDiv.textContent, '弹幕已关闭 · 字幕已关闭');
+  assert.equal(context.infoDiv.style.opacity, '1');
+
+  const nativeToastItem = createElement({ text: '字幕 已关闭' });
+  const nativeToast = createElement();
+  nativeToast.descendants.push(nativeToastItem);
+  selectors['.bpx-player-toast-wrap'] = [nativeToast];
+  context.observers[1].trigger();
+
+  assert.equal(context.infoDiv.textContent, '弹幕已关闭');
+  assert.equal(context.infoDiv.style.opacity, '1');
+  assert.equal(context.infoDiv.style.bottom, '108px');
+  assert.equal(context.timers[2].cancelled, undefined, 'the restarted timer is preserved');
+
+  nativeToastItem.style.opacity = '0';
+  context.timers[3].callback();
+  assert.equal(context.infoDiv.textContent, '弹幕已关闭', 'the covered item is not shown again');
+  assert.equal(context.infoDiv.style.bottom, '60px');
 });
 
 test('native toast during the final fade removes the script notice', () => {
