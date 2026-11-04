@@ -755,8 +755,16 @@
   let tailSec = getNumberFromStorage(KEY_TAIL);
   let enabled = getStoredValue(KEY_ENABLED) === 'true';
 
-  // 创建播放器内提示
-  const infoDiv = document.createElement('div');
+  // 创建播放器内提示。原生自动提示的结构为 toast-auto > toast-row > toast-item > toast-text。
+  const nativeNoticeRow = document.createElement('div');
+  nativeNoticeRow.className = 'bpx-player-toast-row bpx-player-toast-unfold bilibili-player-toolkit-toast-row';
+  nativeNoticeRow.setAttribute('data-bilibili-player-toolkit-toast', '');
+  const nativeNoticeItem = document.createElement('div');
+  nativeNoticeItem.className = 'bpx-player-toast-item';
+  const infoDiv = document.createElement('span');
+  infoDiv.className = 'bpx-player-toast-text';
+  nativeNoticeItem.appendChild(infoDiv);
+  nativeNoticeRow.appendChild(nativeNoticeItem);
   Object.assign(infoDiv.style, {
     position: 'fixed', bottom: '80px', right: '20px',
     padding: '7px 16px', background: 'rgba(25,25,25,0.88)',
@@ -789,21 +797,41 @@
     return null;
   }
 
+  function isHiddenNoticeElement(element) {
+    for (let current = element; current
+      && (typeof current.nodeType === 'undefined' || current.nodeType === 1);
+      current = current.parentElement || current.parentNode) {
+      const style = window.getComputedStyle(current);
+      if (style.visibility === 'hidden' || style.visibility === 'collapse'
+        || style.display === 'none' || Number(style.opacity) === 0) return true;
+    }
+    return false;
+  }
+
+  function findNativeNoticeList() {
+    return queryPlayerElements('.bpx-player-toast-auto').find((container) => {
+      if (container.isConnected === false || typeof container.appendChild !== 'function') return false;
+      if (isHiddenNoticeElement(container)) return false;
+      const player = typeof container.closest === 'function'
+        ? container.closest('.bpx-player-video-area, .bpx-player-container, #bilibili-player, #bofqi')
+        : null;
+      return !player || player.getClientRects().length;
+    }) || null;
+  }
+
   function hasMatchingNativeNotice(message) {
     const stateNotice = message.match(/^(字幕|弹幕)已(开启|关闭)$/);
     if (!stateNotice) return false;
 
     const [, subject, state] = stateNotice;
     return queryPlayerElements('.bpx-player-toast-wrap').some((container) => {
-      return Array.from(container.querySelectorAll('*')).some((element) => {
+      const toastSelector = '.bpx-player-toast-row, .bpx-player-toast-item';
+      return Array.from(container.querySelectorAll(toastSelector)).some((element) => {
+        if (element.querySelector(toastSelector)) return false;
+        if (element === nativeNoticeRow || nativeNoticeRow.contains(element)
+          || element.contains(nativeNoticeRow)) return false;
         if (!element.getClientRects().length) return false;
-        for (let current = element; current
-          && (typeof current.nodeType === 'undefined' || current.nodeType === 1);
-          current = current.parentElement || current.parentNode) {
-          const style = window.getComputedStyle(current);
-          if (style.visibility === 'hidden' || style.visibility === 'collapse'
-            || style.display === 'none' || Number(style.opacity) === 0) return false;
-        }
+        if (isHiddenNoticeElement(element)) return false;
 
         const text = (element.textContent || '').replace(/\s+/g, '');
         const hasSameState = state === '开启'
@@ -812,11 +840,6 @@
         return text.includes(subject) && hasSameState;
       });
     });
-  }
-
-  function hasNativePlayerStateNotice() {
-    return ['字幕已开启', '字幕已关闭', '弹幕已开启', '弹幕已关闭']
-      .some(hasMatchingNativeNotice);
   }
 
   function isPlayerStateNotice(message) {
@@ -834,13 +857,60 @@
     };
   }
 
-  function positionNoticeAboveNativeNotice(aboveNativeNotice) {
-    if (infoDiv.style.position === 'absolute') {
-      infoDiv.style.bottom = aboveNativeNotice ? '108px' : '60px';
+  function positionNoticeAboveNativeNotices() {
+    if (infoDiv.style.position !== 'absolute' || !infoDiv.parentNode) return;
+
+    const nativeNotices = queryPlayerElements('.bpx-player-toast-wrap').flatMap((container) => {
+      return Array.from(container.querySelectorAll('.bpx-player-toast-row, .bpx-player-toast-item'));
+    }).filter((element) => element !== nativeNoticeRow
+      && !nativeNoticeRow.contains(element)
+      && element.getClientRects().length
+      && !isHiddenNoticeElement(element));
+    if (!nativeNotices.length) {
+      infoDiv.style.bottom = '60px';
+      return;
+    }
+
+    const highestTop = Math.min(...nativeNotices.map((element) => element.getBoundingClientRect().top));
+    const containerBottom = infoDiv.parentNode.getBoundingClientRect().bottom;
+    infoDiv.style.bottom = `${Math.max(60, Math.ceil(containerBottom - highestTop + 8))}px`;
+  }
+
+  function mountInNativeNoticeList(container) {
+    Object.assign(infoDiv.style, {
+      position: 'static', bottom: 'auto', left: 'auto', right: 'auto',
+      padding: '0', background: 'none', color: '', fontSize: '', lineHeight: '',
+      borderRadius: '0', zIndex: 'auto', fontFamily: '', maxWidth: 'none',
+      boxSizing: 'content-box', pointerEvents: 'none', transition: 'opacity 0.5s'
+    });
+    nativeNoticeRow.style.transition = 'opacity 0.5s';
+    if (infoDiv.parentNode !== nativeNoticeItem) nativeNoticeItem.appendChild(infoDiv);
+    if (nativeNoticeRow.parentNode !== container) container.appendChild(nativeNoticeRow);
+  }
+
+  function removeNoticeElement() {
+    if (nativeNoticeRow.parentNode) nativeNoticeRow.parentNode.removeChild(nativeNoticeRow);
+    if (infoDiv.parentNode && infoDiv.parentNode !== nativeNoticeItem) {
+      infoDiv.parentNode.removeChild(infoDiv);
     }
   }
 
+  function scheduleNoticeRemoval() {
+    if (nativeNoticeStopTimer !== null) clearTimeout(nativeNoticeStopTimer);
+    nativeNoticeStopTimer = setTimeout(() => {
+      nativeNoticeStopTimer = null;
+      removeNoticeElement();
+      stopWatchingForNativeNotice();
+    }, 500);
+  }
+
   function ensureInfoDivMounted() {
+    const nativeNoticeList = findNativeNoticeList();
+    if (nativeNoticeList) {
+      mountInNativeNoticeList(nativeNoticeList);
+      return;
+    }
+
     const playerContainer = findNoticeContainer();
     const targetContainer = playerContainer || getOverlayContainer();
     if (!targetContainer) return;
@@ -848,15 +918,22 @@
     if (playerContainer) {
       Object.assign(infoDiv.style, {
         position: 'absolute', bottom: '60px', left: '10px', right: 'auto',
-        maxWidth: 'calc(100% - 20px)', boxSizing: 'border-box'
+        maxWidth: 'calc(100% - 20px)', boxSizing: 'border-box',
+        padding: '7px 16px', background: 'rgba(25,25,25,0.88)', color: '#fff',
+        fontSize: '14px', lineHeight: '28px', borderRadius: '4px', zIndex: 999999,
+        fontFamily: 'sans-serif', pointerEvents: 'none', transition: 'opacity 0.5s'
       });
     } else {
       Object.assign(infoDiv.style, {
         position: 'fixed', bottom: '80px', left: 'auto', right: '20px',
-        maxWidth: 'none', boxSizing: 'content-box'
+        maxWidth: 'none', boxSizing: 'content-box',
+        padding: '7px 16px', background: 'rgba(25,25,25,0.88)', color: '#fff',
+        fontSize: '14px', lineHeight: '28px', borderRadius: '4px', zIndex: 999999,
+        fontFamily: 'sans-serif', pointerEvents: 'none', transition: 'opacity 0.5s'
       });
     }
 
+    if (nativeNoticeRow.parentNode) nativeNoticeRow.parentNode.removeChild(nativeNoticeRow);
     if (infoDiv.parentNode !== targetContainer) targetContainer.appendChild(infoDiv);
   }
 
@@ -874,8 +951,7 @@
       ? infoDiv.textContent
       : message;
     const uncoveredNotice = getUncoveredPlayerStateNotice(displayedMessage);
-    const hasNativeNotice = hasNativePlayerStateNotice();
-    positionNoticeAboveNativeNotice(hasNativeNotice);
+    positionNoticeAboveNativeNotices();
     if (!uncoveredNotice.covered) return false;
 
     if (uncoveredNotice.message) {
@@ -884,10 +960,14 @@
     }
 
     infoDiv.style.opacity = '0';
+    nativeNoticeRow.style.opacity = '0';
     initialPlayerStateNoticeVisible = false;
     if (hideTimer) clearTimeout(hideTimer);
     hideTimer = null;
-    stopWatchingForNativeNotice();
+    const mountedOutsideDetachedNativeItem = infoDiv.parentNode
+      && infoDiv.parentNode !== nativeNoticeItem;
+    if (nativeNoticeRow.parentNode || mountedOutsideDetachedNativeItem) scheduleNoticeRemoval();
+    else stopWatchingForNativeNotice();
     return true;
   }
 
@@ -897,7 +977,9 @@
     if (!playerContainer) return;
 
     nativeNoticeObserver = new MutationObserver(() => {
-      hideNoticeIfNativeAppears(message);
+      if (hideNoticeIfNativeAppears(message) || infoDiv.style.opacity !== '1') return;
+      ensureInfoDivMounted();
+      positionNoticeAboveNativeNotices();
     });
     nativeNoticeObserver.observe(playerContainer, {
       childList: true, subtree: true, characterData: true, attributes: true
@@ -920,8 +1002,9 @@
     if (hideNoticeIfNativeAppears(message)) return;
 
     ensureInfoDivMounted();
-    positionNoticeAboveNativeNotice(hasNativePlayerStateNotice());
+    positionNoticeAboveNativeNotices();
     infoDiv.style.opacity = '1';
+    nativeNoticeRow.style.opacity = '1';
 
     if (hideTimer) clearTimeout(hideTimer);
     hideTimer = setTimeout(() => {
@@ -932,7 +1015,8 @@
         clearTimeout(nativeNoticeVisibilityTimer);
         nativeNoticeVisibilityTimer = null;
       }
-      nativeNoticeStopTimer = setTimeout(stopWatchingForNativeNotice, 500);
+      nativeNoticeRow.style.opacity = '0';
+      scheduleNoticeRemoval();
     }, 3000);
     watchForNativeNotice(infoDiv.textContent);
   }
