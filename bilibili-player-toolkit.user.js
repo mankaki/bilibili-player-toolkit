@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站播放器增强工具箱
 // @namespace    https://www.bilibili.com/
-// @version      3.2.1
+// @version      3.2.2
 // @description  自动跳片头片尾、选集显示 P 序号、C 键切换中文字幕、D 键切换弹幕开关，并优先使用新版画中画
 // @author       mankaki (modified)
 // @match        *://www.bilibili.com/video/*
@@ -16,7 +16,7 @@
 (function () {
   'use strict';
 
-  const TOOLKIT_VERSION = '3.2.1';
+  const TOOLKIT_VERSION = '3.2.2';
   const KEY_HEAD = 'bili_skip_head';
   const KEY_TAIL = 'bili_skip_tail';
   const KEY_ENABLED = 'bili_skip_enabled';
@@ -107,6 +107,12 @@
   ].join(', ');
   let enhancementUpdateFrame = null;
   let defaultPreferenceRetryTimers = [];
+  let initialDanmakuStateNoticeShown = false;
+  let initialSubtitleStateNoticeShown = false;
+  let initialPlayerStateNoticeVisible = false;
+  let initialPlayerStateNoticeRetryTimer = null;
+  let initialPlayerStateNoticeKey = observedPlaybackKey;
+  let initialPlayerStateNoticeRetryAttempts = 0;
   let subtitleCloseConfirmationTimer = null;
   let subtitleCloseConfirmationKey = null;
   let subtitleCloseAttemptsKey = observedPlaybackKey;
@@ -425,8 +431,96 @@
 
     // 播放器会在控件出现后异步恢复弹幕或字幕状态，轮询设有上限。
     [0, 100, 250, 500, 1000, 2000, 4000, 7000].forEach((delay) => {
-      defaultPreferenceRetryTimers.push(setTimeout(schedulePlayerEnhancementUpdate, delay));
+      defaultPreferenceRetryTimers.push(setTimeout(() => {
+        schedulePlayerEnhancementUpdate();
+        if (delay === 0) {
+          defaultPreferenceRetryTimers.push(setTimeout(showInitialPlayerStateNotices, 100));
+        }
+      }, delay));
     });
+  }
+
+  function showInitialPlayerStateNotices() {
+    const playbackKey = getPlaybackKey();
+    if (initialPlayerStateNoticeKey !== playbackKey) return;
+    if (initialDanmakuStateNoticeShown && initialSubtitleStateNoticeShown) return;
+
+    const pendingNotices = [];
+
+    if (!initialDanmakuStateNoticeShown) {
+      const danmakuControl = findDanmakuSwitch();
+      if (danmakuControl) {
+        const danmakuInput = danmakuControl.querySelector('input[type="checkbox"]');
+        pendingNotices.push({
+          type: 'danmaku',
+          message: isDanmakuEnabled(danmakuInput) ? '弹幕已开启' : '弹幕已关闭'
+        });
+      }
+    }
+
+    // 默认关闭字幕时先等待现有的 500ms 确认完成，避免报告播放器恢复前的旧状态。
+    if (!initialSubtitleStateNoticeShown && subtitleCloseConfirmationTimer === null) {
+      const { chinese, closeSwitch } = getChineseSubtitleControls();
+      if (chinese && closeSwitch) {
+        pendingNotices.push({
+          type: 'subtitle',
+          message: closeSwitch.classList.contains('bpx-state-active')
+            ? '字幕已关闭'
+            : '字幕已开启'
+        });
+      }
+    }
+
+    const scriptNotices = pendingNotices.filter(({ type, message }) => {
+      if (!hasMatchingNativeNotice(message)) return true;
+      if (type === 'danmaku') initialDanmakuStateNoticeShown = true;
+      else initialSubtitleStateNoticeShown = true;
+      return false;
+    });
+    if (scriptNotices.length) {
+      showInitialPlayerStateNotice(scriptNotices.map(({ message }) => message));
+      scriptNotices.forEach(({ type }) => {
+        if (type === 'danmaku') initialDanmakuStateNoticeShown = true;
+        else initialSubtitleStateNoticeShown = true;
+      });
+    }
+
+    if (!initialDanmakuStateNoticeShown || !initialSubtitleStateNoticeShown) {
+      scheduleInitialPlayerStateNoticeRetry(playbackKey);
+    }
+  }
+
+  function showInitialPlayerStateNotice(messages) {
+    const visibleMessages = initialPlayerStateNoticeVisible
+      && infoDiv.style.opacity === '1'
+      && isPlayerStateNotice(infoDiv.textContent)
+      ? infoDiv.textContent.split(' · ')
+      : [];
+    const mergedMessages = [...new Set([...visibleMessages, ...messages])];
+    initialPlayerStateNoticeVisible = true;
+    showNotice(mergedMessages.join(' · '), true);
+  }
+
+  function scheduleInitialPlayerStateNoticeRetry(playbackKey) {
+    if (initialPlayerStateNoticeRetryTimer !== null
+      || initialPlayerStateNoticeRetryAttempts >= 30) return;
+
+    initialPlayerStateNoticeRetryAttempts++;
+    initialPlayerStateNoticeRetryTimer = setTimeout(() => {
+      initialPlayerStateNoticeRetryTimer = null;
+      if (initialPlayerStateNoticeKey !== playbackKey
+        || getPlaybackKey() !== playbackKey) return;
+      showInitialPlayerStateNotices();
+    }, 500);
+  }
+
+  function cancelInitialPlayerStateNotices() {
+    if (initialPlayerStateNoticeRetryTimer !== null) {
+      clearTimeout(initialPlayerStateNoticeRetryTimer);
+    }
+    initialPlayerStateNoticeRetryTimer = null;
+    initialPlayerStateNoticeKey = null;
+    initialPlayerStateNoticeVisible = false;
   }
 
   function getChineseSubtitleControls() {
@@ -661,35 +755,270 @@
   let tailSec = getNumberFromStorage(KEY_TAIL);
   let enabled = getStoredValue(KEY_ENABLED) === 'true';
 
-  // 创建浮窗
-  const infoDiv = document.createElement('div');
+  // 创建播放器内提示。原生自动提示的结构为 toast-auto > toast-row > toast-item > toast-text。
+  const nativeNoticeRow = document.createElement('div');
+  nativeNoticeRow.className = 'bpx-player-toast-row bpx-player-toast-unfold bilibili-player-toolkit-toast-row';
+  nativeNoticeRow.setAttribute('data-bilibili-player-toolkit-toast', '');
+  const nativeNoticeItem = document.createElement('div');
+  nativeNoticeItem.className = 'bpx-player-toast-item';
+  const infoDiv = document.createElement('span');
+  infoDiv.className = 'bpx-player-toast-text';
+  nativeNoticeItem.appendChild(infoDiv);
+  nativeNoticeRow.appendChild(nativeNoticeItem);
   Object.assign(infoDiv.style, {
     position: 'fixed', bottom: '80px', right: '20px',
-    padding: '8px 12px', background: 'rgba(0,0,0,0.7)',
-    color: '#fff', fontSize: '14px', borderRadius: '4px',
+    padding: '7px 16px', background: 'rgba(25,25,25,0.88)',
+    color: '#fff', fontSize: '14px', lineHeight: '28px', borderRadius: '4px',
     zIndex: 999999, fontFamily: 'sans-serif',
     opacity: 0, pointerEvents: 'none', transition: 'opacity 0.5s'
   });
 
   let hideTimer = null;
+  let nativeNoticeObserver = null;
+  let nativeNoticeStopTimer = null;
+  let nativeNoticeVisibilityTimer = null;
 
   function getOverlayContainer() {
     return document.fullscreenElement || document.webkitFullscreenElement || document.body || document.documentElement;
   }
 
-  function ensureInfoDivMounted() {
-    const targetContainer = getOverlayContainer();
-    if (!targetContainer || infoDiv.parentNode === targetContainer) return;
-    targetContainer.appendChild(infoDiv);
+  function findNoticeContainer() {
+    for (const selector of [
+      '.bpx-player-video-area',
+      '.bpx-player-container',
+      '#bilibili-player',
+      '#bofqi'
+    ]) {
+      const candidates = queryPlayerElements(selector);
+      const visible = candidates.find((element) => element.getClientRects().length
+        && window.getComputedStyle(element).position !== 'static');
+      if (visible) return visible;
+    }
+    return null;
   }
 
-  function showNotice(message) {
-    ensureInfoDivMounted();
+  function isHiddenNoticeElement(element) {
+    for (let current = element; current
+      && (typeof current.nodeType === 'undefined' || current.nodeType === 1);
+      current = current.parentElement || current.parentNode) {
+      const style = window.getComputedStyle(current);
+      if (style.visibility === 'hidden' || style.visibility === 'collapse'
+        || style.display === 'none' || Number(style.opacity) === 0) return true;
+    }
+    return false;
+  }
+
+  function findNativeNoticeList() {
+    return queryPlayerElements('.bpx-player-toast-auto').find((container) => {
+      if (container.isConnected === false || typeof container.appendChild !== 'function') return false;
+      if (isHiddenNoticeElement(container)) return false;
+      const player = typeof container.closest === 'function'
+        ? container.closest('.bpx-player-video-area, .bpx-player-container, #bilibili-player, #bofqi')
+        : null;
+      return !player || player.getClientRects().length;
+    }) || null;
+  }
+
+  function hasMatchingNativeNotice(message) {
+    const stateNotice = message.match(/^(字幕|弹幕)已(开启|关闭)$/);
+    if (!stateNotice) return false;
+
+    const [, subject, state] = stateNotice;
+    return queryPlayerElements('.bpx-player-toast-wrap').some((container) => {
+      const toastSelector = '.bpx-player-toast-row, .bpx-player-toast-item';
+      return Array.from(container.querySelectorAll(toastSelector)).some((element) => {
+        if (element.querySelector(toastSelector)) return false;
+        if (element === nativeNoticeRow || nativeNoticeRow.contains(element)
+          || element.contains(nativeNoticeRow)) return false;
+        if (!element.getClientRects().length) return false;
+        if (isHiddenNoticeElement(element)) return false;
+
+        const text = (element.textContent || '').replace(/\s+/g, '');
+        const hasSameState = state === '开启'
+          ? /开启|打开|切换至/.test(text)
+          : /关闭|关掉/.test(text);
+        return text.includes(subject) && hasSameState;
+      });
+    });
+  }
+
+  function isPlayerStateNotice(message) {
+    return /^(?:字幕|弹幕)已(?:开启|关闭)(?: · (?:字幕|弹幕)已(?:开启|关闭))*$/.test(message);
+  }
+
+  function getUncoveredPlayerStateNotice(message) {
+    if (!isPlayerStateNotice(message)) return { message, covered: false };
+
+    const items = message.split(' · ');
+    const remainingItems = items.filter((item) => !hasMatchingNativeNotice(item));
+    return {
+      message: remainingItems.join(' · '),
+      covered: remainingItems.length !== items.length
+    };
+  }
+
+  function positionNoticeAboveNativeNotices() {
+    if (infoDiv.style.position !== 'absolute' || !infoDiv.parentNode) return;
+
+    const nativeNotices = queryPlayerElements('.bpx-player-toast-wrap').flatMap((container) => {
+      return Array.from(container.querySelectorAll('.bpx-player-toast-row, .bpx-player-toast-item'));
+    }).filter((element) => element !== nativeNoticeRow
+      && !nativeNoticeRow.contains(element)
+      && element.getClientRects().length
+      && !isHiddenNoticeElement(element));
+    if (!nativeNotices.length) {
+      infoDiv.style.bottom = '60px';
+      return;
+    }
+
+    const highestTop = Math.min(...nativeNotices.map((element) => element.getBoundingClientRect().top));
+    const containerBottom = infoDiv.parentNode.getBoundingClientRect().bottom;
+    infoDiv.style.bottom = `${Math.max(60, Math.ceil(containerBottom - highestTop + 8))}px`;
+  }
+
+  function mountInNativeNoticeList(container) {
+    Object.assign(infoDiv.style, {
+      position: 'static', bottom: 'auto', left: 'auto', right: 'auto',
+      padding: '0', background: 'none', color: '', fontSize: '', lineHeight: '',
+      borderRadius: '0', zIndex: 'auto', fontFamily: '', maxWidth: 'none',
+      boxSizing: 'content-box', pointerEvents: 'none', transition: 'opacity 0.5s'
+    });
+    nativeNoticeRow.style.transition = 'opacity 0.5s';
+    if (infoDiv.parentNode !== nativeNoticeItem) nativeNoticeItem.appendChild(infoDiv);
+    if (nativeNoticeRow.parentNode !== container) container.appendChild(nativeNoticeRow);
+  }
+
+  function removeNoticeElement() {
+    if (nativeNoticeRow.parentNode) nativeNoticeRow.parentNode.removeChild(nativeNoticeRow);
+    if (infoDiv.parentNode && infoDiv.parentNode !== nativeNoticeItem) {
+      infoDiv.parentNode.removeChild(infoDiv);
+    }
+  }
+
+  function scheduleNoticeRemoval() {
+    if (nativeNoticeStopTimer !== null) clearTimeout(nativeNoticeStopTimer);
+    nativeNoticeStopTimer = setTimeout(() => {
+      nativeNoticeStopTimer = null;
+      removeNoticeElement();
+      stopWatchingForNativeNotice();
+    }, 500);
+  }
+
+  function ensureInfoDivMounted() {
+    const nativeNoticeList = findNativeNoticeList();
+    if (nativeNoticeList) {
+      mountInNativeNoticeList(nativeNoticeList);
+      return;
+    }
+
+    const playerContainer = findNoticeContainer();
+    const targetContainer = playerContainer || getOverlayContainer();
+    if (!targetContainer) return;
+
+    if (playerContainer) {
+      Object.assign(infoDiv.style, {
+        position: 'absolute', bottom: '60px', left: '10px', right: 'auto',
+        maxWidth: 'calc(100% - 20px)', boxSizing: 'border-box',
+        padding: '7px 16px', background: 'rgba(25,25,25,0.88)', color: '#fff',
+        fontSize: '14px', lineHeight: '28px', borderRadius: '4px', zIndex: 999999,
+        fontFamily: 'sans-serif', pointerEvents: 'none', transition: 'opacity 0.5s'
+      });
+    } else {
+      Object.assign(infoDiv.style, {
+        position: 'fixed', bottom: '80px', left: 'auto', right: '20px',
+        maxWidth: 'none', boxSizing: 'content-box',
+        padding: '7px 16px', background: 'rgba(25,25,25,0.88)', color: '#fff',
+        fontSize: '14px', lineHeight: '28px', borderRadius: '4px', zIndex: 999999,
+        fontFamily: 'sans-serif', pointerEvents: 'none', transition: 'opacity 0.5s'
+      });
+    }
+
+    if (nativeNoticeRow.parentNode) nativeNoticeRow.parentNode.removeChild(nativeNoticeRow);
+    if (infoDiv.parentNode !== targetContainer) targetContainer.appendChild(infoDiv);
+  }
+
+  function stopWatchingForNativeNotice() {
+    if (nativeNoticeObserver) nativeNoticeObserver.disconnect();
+    nativeNoticeObserver = null;
+    if (nativeNoticeStopTimer !== null) clearTimeout(nativeNoticeStopTimer);
+    nativeNoticeStopTimer = null;
+    if (nativeNoticeVisibilityTimer !== null) clearTimeout(nativeNoticeVisibilityTimer);
+    nativeNoticeVisibilityTimer = null;
+  }
+
+  function hideNoticeIfNativeAppears(message) {
+    const displayedMessage = isPlayerStateNotice(infoDiv.textContent)
+      ? infoDiv.textContent
+      : message;
+    const uncoveredNotice = getUncoveredPlayerStateNotice(displayedMessage);
+    positionNoticeAboveNativeNotices();
+    if (!uncoveredNotice.covered) return false;
+
+    if (uncoveredNotice.message) {
+      infoDiv.textContent = uncoveredNotice.message;
+      return false;
+    }
+
+    infoDiv.style.opacity = '0';
+    nativeNoticeRow.style.opacity = '0';
+    initialPlayerStateNoticeVisible = false;
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = null;
+    const mountedOutsideDetachedNativeItem = infoDiv.parentNode
+      && infoDiv.parentNode !== nativeNoticeItem;
+    if (nativeNoticeRow.parentNode || mountedOutsideDetachedNativeItem) scheduleNoticeRemoval();
+    else stopWatchingForNativeNotice();
+    return true;
+  }
+
+  function watchForNativeNotice(message) {
+    stopWatchingForNativeNotice();
+    const playerContainer = findNoticeContainer();
+    if (!playerContainer) return;
+
+    nativeNoticeObserver = new MutationObserver(() => {
+      if (hideNoticeIfNativeAppears(message) || infoDiv.style.opacity !== '1') return;
+      ensureInfoDivMounted();
+      positionNoticeAboveNativeNotices();
+    });
+    nativeNoticeObserver.observe(playerContainer, {
+      childList: true, subtree: true, characterData: true, attributes: true
+    });
+
+    if (isPlayerStateNotice(message)) {
+      const recheckVisibility = () => {
+        nativeNoticeVisibilityTimer = null;
+        if (infoDiv.style.opacity !== '1' || hideNoticeIfNativeAppears(message)) return;
+        nativeNoticeVisibilityTimer = setTimeout(recheckVisibility, 100);
+      };
+      nativeNoticeVisibilityTimer = setTimeout(recheckVisibility, 100);
+    }
+  }
+
+  function showNotice(message, preserveInitialPlayerStateNotice = false) {
+    stopWatchingForNativeNotice();
+    if (!preserveInitialPlayerStateNotice) initialPlayerStateNoticeVisible = false;
     infoDiv.textContent = message;
+    if (hideNoticeIfNativeAppears(message)) return;
+
+    ensureInfoDivMounted();
+    positionNoticeAboveNativeNotices();
     infoDiv.style.opacity = '1';
+    nativeNoticeRow.style.opacity = '1';
 
     if (hideTimer) clearTimeout(hideTimer);
-    hideTimer = setTimeout(() => infoDiv.style.opacity = '0', 3000);
+    hideTimer = setTimeout(() => {
+      infoDiv.style.opacity = '0';
+      initialPlayerStateNoticeVisible = false;
+      hideTimer = null;
+      if (nativeNoticeVisibilityTimer !== null) {
+        clearTimeout(nativeNoticeVisibilityTimer);
+        nativeNoticeVisibilityTimer = null;
+      }
+      nativeNoticeRow.style.opacity = '0';
+      scheduleNoticeRemoval();
+    }, 3000);
+    watchForNativeNotice(infoDiv.textContent);
   }
 
   function showInfo() {
@@ -1053,6 +1382,7 @@
     if (playbackKey === observedPlaybackKey) return;
 
     observedPlaybackKey = playbackKey;
+    cancelInitialPlayerStateNotices();
     cancelSubtitleCloseConfirmation();
     const { renderedSubtitles } = getChineseSubtitleControls();
     resetSubtitleCloseAttempts(
