@@ -173,6 +173,7 @@ test('document click listener preserves controls exposed by an open shadow root'
   const subtitleControl = new FakeElement('subtitle-close-switch');
   let state = 'mixed';
   let danmakuClicks = 0;
+  const notices = [];
   const input = {
     getAttribute: () => state,
     click() {
@@ -200,16 +201,20 @@ test('document click listener preserves controls exposed by an open shadow root'
     getChineseSubtitleControls: () => ({ closeSwitch: null }),
     cancelSubtitleCloseConfirmation() {},
     restoredSubtitleControls: new WeakSet(),
-    subtitleEnabled: null
+    subtitleEnabled: null,
+    showNotice: (message) => notices.push(message)
   };
   vm.runInNewContext(`
     const MODE_CLOSED = 'closed';
     let danmakuDefaultMode = MODE_CLOSED;
+    let inheritedDanmakuEnabled = false;
+    let inheritedSubtitleEnabled = false;
     let danmakuUserOverrideKey = null;
     let subtitleUserOverrideKey = null;
     const handledManualControlEvents = new WeakSet();
     ${extractFunction('getPlaybackKey')}
     ${extractFunction('skipSimplifiedDanmakuState')}
+    ${extractFunction('isDanmakuEnabled')}
     ${extractFunction('closestCrossShadow')}
     ${extractFunction('findControlInEvent')}
     ${extractFunction('saveNativeSubtitleState')}
@@ -227,6 +232,7 @@ test('document click listener preserves controls exposed by an open shadow root'
   pendingTasks.shift()();
   assert.equal(state, 'false');
   assert.equal(danmakuClicks, 1);
+  assert.deepEqual(notices, ['弹幕已关闭']);
 
   listener({
     isTrusted: true,
@@ -234,6 +240,70 @@ test('document click listener preserves controls exposed by an open shadow root'
     composedPath: () => [subtitleControl, host]
   });
   assert.equal(context.getOverrides().subtitleUserOverrideKey, 'video:bv1|p=1');
+});
+
+test('native danmaku button reports state without changing unchanged mode behavior', () => {
+  let listener;
+  const pendingTasks = [];
+  const notices = [];
+  class FakeElement {
+    constructor(match = null) { this.match = match; }
+    closest(selector) { return selector.includes(this.match) ? this : null; }
+    getRootNode() { return null; }
+  }
+  class FakeShadowRoot {}
+  const host = new FakeElement('not-a-control');
+  let state = 'mixed';
+  let clicks = 0;
+  const input = {
+    getAttribute: () => state,
+    click() { clicks++; state = 'false'; }
+  };
+  const danmakuControl = new FakeElement('dm-switch');
+  danmakuControl.querySelector = () => input;
+  const document = {
+    addEventListener(_type, callback) { listener = callback; }
+  };
+  const context = {
+    URL,
+    location: { href: 'https://www.bilibili.com/video/BV1' },
+    Element: FakeElement,
+    ShadowRoot: FakeShadowRoot,
+    document,
+    setTimeout: (callback) => pendingTasks.push(callback),
+    showNotice: (message) => notices.push(message),
+    getChineseSubtitleControls: () => ({ closeSwitch: null }),
+    cancelSubtitleCloseConfirmation() {},
+    restoredSubtitleControls: new WeakSet(),
+    subtitleEnabled: null
+  };
+  vm.runInNewContext(`
+    const MODE_CLOSED = 'closed';
+    let danmakuDefaultMode = 'unchanged';
+    let inheritedDanmakuEnabled = false;
+    let inheritedSubtitleEnabled = false;
+    let danmakuUserOverrideKey = null;
+    let subtitleUserOverrideKey = null;
+    const handledManualControlEvents = new WeakSet();
+    ${extractFunction('getPlaybackKey')}
+    ${extractFunction('skipSimplifiedDanmakuState')}
+    ${extractFunction('isDanmakuEnabled')}
+    ${extractFunction('closestCrossShadow')}
+    ${extractFunction('findControlInEvent')}
+    ${extractFunction('saveNativeSubtitleState')}
+    ${extractFunction('handleManualPlayerControlClick')}
+    document.addEventListener('click', handleManualPlayerControlClick, true);
+  `, context);
+
+  listener({
+    isTrusted: true,
+    target: host,
+    composedPath: () => [danmakuControl, host]
+  });
+  pendingTasks.shift()();
+  assert.equal(state, 'mixed');
+  assert.equal(clicks, 0);
+  assert.deepEqual(notices, ['弹幕已开启']);
 });
 
 test('closed shadow root listener preserves controls hidden from the document path', () => {
@@ -305,17 +375,21 @@ test('closed shadow root listener preserves controls hidden from the document pa
     cancelSubtitleCloseConfirmation() {},
     restoredSubtitleControls: new WeakSet(),
     subtitleEnabled: null,
+    showNotice() {},
     host,
     root
   };
   vm.runInNewContext(`
     const MODE_CLOSED = 'closed';
     let danmakuDefaultMode = MODE_CLOSED;
+    let inheritedDanmakuEnabled = false;
+    let inheritedSubtitleEnabled = false;
     let danmakuUserOverrideKey = null;
     let subtitleUserOverrideKey = null;
     const handledManualControlEvents = new WeakSet();
     ${extractFunction('getPlaybackKey')}
     ${extractFunction('skipSimplifiedDanmakuState')}
+    ${extractFunction('isDanmakuEnabled')}
     ${extractFunction('closestCrossShadow')}
     ${extractFunction('findControlInEvent')}
     ${extractFunction('saveNativeSubtitleState')}
