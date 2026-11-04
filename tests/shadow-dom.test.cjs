@@ -109,7 +109,8 @@ test('default-state retries cover delayed initial and SPA restoration with a fin
       timers.push({ callback, delay });
       return delay;
     },
-    schedulePlayerEnhancementUpdate: () => scheduled++
+    schedulePlayerEnhancementUpdate: () => scheduled++,
+    showInitialPlayerStateNotices() {}
   };
   vm.runInNewContext(`
     let defaultPreferenceRetryTimers = [];
@@ -121,12 +122,13 @@ test('default-state retries cover delayed initial and SPA restoration with a fin
   assert.deepEqual(timers.map(({ delay }) => delay), [0, 100, 250, 500, 1000, 2000, 4000, 7000]);
   timers.at(-1).callback();
   assert.equal(scheduled, 1, 'initial page still checks a state restored after one second');
+  assert.equal(timers.at(-1).delay, 100, 'initial state is reported after the final update');
 
   timers.length = 0;
   context.start();
   timers.at(-1).callback();
   assert.equal(scheduled, 2, 'SPA navigation starts the same bounded late-state check');
-  assert.equal(timers.length, 8, 'retry schedule remains bounded');
+  assert.equal(timers.length, 9, 'retry schedule and the final state report remain bounded');
 });
 
 test('subtitle controls are discovered inside captured open or closed shadow roots', () => {

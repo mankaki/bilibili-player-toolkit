@@ -1,0 +1,318 @@
+const assert = require('node:assert/strict');
+const { readFileSync } = require('node:fs');
+const { test } = require('node:test');
+const vm = require('node:vm');
+
+const source = readFileSync(`${__dirname}/../bilibili-player-toolkit.user.js`, 'utf8');
+
+function extractFunction(name) {
+  const start = source.indexOf(`  function ${name}(`);
+  assert.notEqual(start, -1, `missing function ${name}`);
+  const bodyStart = source.indexOf('{', start);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index++) {
+    if (source[index] === '{') depth++;
+    if (source[index] === '}' && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`unterminated function ${name}`);
+}
+
+function createElement({ visible = true, position = 'relative', text = '' } = {}) {
+  return {
+    parentNode: null,
+    style: {},
+    textContent: text,
+    descendants: [],
+    getClientRects: () => visible ? [{}] : [],
+    querySelectorAll() { return this.descendants; },
+    computedPosition: position,
+    appendChild(child) {
+      child.parentNode = this;
+    }
+  };
+}
+
+function setup({ selectors = {}, fullscreenElement = null } = {}) {
+  const infoDiv = createElement();
+  const fallback = createElement();
+  const timers = [];
+  const observers = [];
+  class FakeMutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+      observers.push(this);
+    }
+    observe(target, options) {
+      this.target = target;
+      this.options = options;
+    }
+    disconnect() { this.disconnected = true; }
+    trigger() { this.callback([]); }
+  }
+  const context = {
+    document: {
+      fullscreenElement,
+      webkitFullscreenElement: null,
+      body: fallback,
+      documentElement: createElement()
+    },
+    window: {
+      getComputedStyle: (element) => ({
+        position: element.computedPosition,
+        visibility: element.style.visibility || 'visible',
+        display: element.style.display || 'block',
+        opacity: element.style.opacity ?? '1'
+      })
+    },
+    MutationObserver: FakeMutationObserver,
+    infoDiv,
+    hideTimer: null,
+    nativeNoticeObserver: null,
+    nativeNoticeStopTimer: null,
+    nativeNoticeVisibilityTimer: null,
+    queryPlayerElements: (selector) => selectors[selector] || [],
+    setTimeout(callback, delay) {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimeout(timer) { timers[timer - 1].cancelled = true; }
+  };
+  vm.runInNewContext(`
+    ${extractFunction('getOverlayContainer')}
+    ${extractFunction('findNoticeContainer')}
+    ${extractFunction('hasMatchingNativeNotice')}
+    ${extractFunction('ensureInfoDivMounted')}
+    ${extractFunction('stopWatchingForNativeNotice')}
+    ${extractFunction('hideNoticeIfNativeAppears')}
+    ${extractFunction('watchForNativeNotice')}
+    ${extractFunction('showNotice')}
+    this.api = { findNoticeContainer, hasMatchingNativeNotice, ensureInfoDivMounted, showNotice };
+  `, context);
+  return { ...context, fallback, timers, observers };
+}
+
+test('notice mounts in the visible video area at the native toast position', () => {
+  const staleArea = createElement({ visible: false });
+  const videoArea = createElement();
+  const playerContainer = createElement();
+  const context = setup({
+    selectors: {
+      '.bpx-player-video-area': [staleArea, videoArea],
+      '.bpx-player-container': [playerContainer]
+    }
+  });
+
+  context.api.showNotice('弹幕已开启');
+
+  assert.equal(context.infoDiv.parentNode, videoArea);
+  assert.equal(context.infoDiv.style.position, 'absolute');
+  assert.equal(context.infoDiv.style.left, '10px');
+  assert.equal(context.infoDiv.style.bottom, '60px');
+  assert.equal(context.infoDiv.style.right, 'auto');
+  assert.equal(context.infoDiv.style.opacity, '1');
+  assert.equal(context.timers[0].delay, 3000);
+  context.timers[0].callback();
+  assert.equal(context.infoDiv.style.opacity, '0');
+});
+
+test('notice container fallbacks cover fullscreen, web fullscreen, and widescreen players', () => {
+  for (const selector of [
+    '.bpx-player-video-area',
+    '.bpx-player-container',
+    '#bilibili-player'
+  ]) {
+    const container = createElement();
+    const context = setup({ selectors: { [selector]: [container] } });
+    context.api.showNotice('播放器状态');
+    assert.equal(context.infoDiv.parentNode, container, selector);
+  }
+});
+
+test('notice mounting does not change a static player container position', () => {
+  const videoArea = createElement({ position: 'static' });
+  const playerContainer = createElement({ position: 'relative' });
+  const context = setup({
+    selectors: {
+      '.bpx-player-video-area': [videoArea],
+      '.bpx-player-container': [playerContainer]
+    }
+  });
+
+  context.api.showNotice('播放器状态');
+
+  assert.equal(context.infoDiv.parentNode, playerContainer);
+  assert.equal(videoArea.style.position, undefined);
+  assert.equal(playerContainer.style.position, undefined);
+});
+
+test('notice remounts after an SPA player rebuild', () => {
+  const firstArea = createElement();
+  const secondArea = createElement();
+  const selectors = { '.bpx-player-video-area': [firstArea] };
+  const context = setup({ selectors });
+
+  context.api.showNotice('第一次');
+  assert.equal(context.infoDiv.parentNode, firstArea);
+
+  firstArea.getClientRects = () => [];
+  selectors['.bpx-player-video-area'] = [firstArea, secondArea];
+  context.api.showNotice('第二次');
+  assert.equal(context.infoDiv.parentNode, secondArea);
+});
+
+test('notice falls back to the original fixed window position without a player', () => {
+  const fullscreenElement = createElement();
+  const context = setup({ fullscreenElement });
+
+  context.api.showNotice('设置已保存');
+
+  assert.equal(context.infoDiv.parentNode, fullscreenElement);
+  assert.equal(context.infoDiv.style.position, 'fixed');
+  assert.equal(context.infoDiv.style.right, '20px');
+  assert.equal(context.infoDiv.style.bottom, '80px');
+});
+
+test('matching native subtitle or danmaku toast suppresses the script notice', () => {
+  const videoArea = createElement();
+  const nativeToastItem = createElement({ text: '字幕 已关闭' });
+  const nativeToast = createElement();
+  nativeToast.descendants.push(nativeToastItem);
+  const context = setup({
+    selectors: {
+      '.bpx-player-video-area': [videoArea],
+      '.bpx-player-toast-wrap': [nativeToast]
+    }
+  });
+
+  context.infoDiv.style.opacity = '1';
+  context.api.showNotice('字幕已关闭');
+
+  assert.equal(context.infoDiv.parentNode, null);
+  assert.equal(context.infoDiv.style.opacity, '0');
+  assert.equal(context.timers.length, 0);
+  assert.equal(context.api.hasMatchingNativeNotice('弹幕已关闭'), false);
+  assert.equal(context.api.hasMatchingNativeNotice('字幕已开启'), false);
+});
+
+test('script notice is removed when the matching native toast appears later', () => {
+  const videoArea = createElement();
+  const selectors = {
+    '.bpx-player-video-area': [videoArea],
+    '.bpx-player-toast-wrap': []
+  };
+  const context = setup({ selectors });
+
+  context.api.showNotice('弹幕已关闭');
+  assert.equal(context.infoDiv.style.opacity, '1');
+
+  const nativeToastItem = createElement({ text: '弹幕 已关闭' });
+  const nativeToast = createElement();
+  nativeToast.descendants.push(nativeToastItem);
+  selectors['.bpx-player-toast-wrap'] = [nativeToast];
+  context.observers[0].trigger();
+
+  assert.equal(context.infoDiv.style.opacity, '0');
+  assert.equal(context.timers[0].cancelled, true, 'the normal fade timer is cleared');
+  assert.equal(context.observers[0].disconnected, true);
+});
+
+test('native toast during the final fade removes the script notice', () => {
+  const videoArea = createElement();
+  const selectors = {
+    '.bpx-player-video-area': [videoArea],
+    '.bpx-player-toast-wrap': []
+  };
+  const context = setup({ selectors });
+
+  context.api.showNotice('弹幕已关闭');
+  context.timers[0].callback();
+  assert.equal(context.infoDiv.style.opacity, '0');
+  assert.equal(context.timers[2].delay, 500);
+  assert.equal(context.observers[0].disconnected, false);
+
+  const nativeToastItem = createElement({ text: '弹幕 已关闭' });
+  const nativeToast = createElement();
+  nativeToast.descendants.push(nativeToastItem);
+  selectors['.bpx-player-toast-wrap'] = [nativeToast];
+  context.observers[0].trigger();
+
+  assert.equal(context.observers[0].disconnected, true);
+  assert.equal(context.timers[2].cancelled, true);
+});
+
+test('native toast becoming visible without a DOM mutation removes the script notice', () => {
+  const videoArea = createElement();
+  const nativeToastItem = createElement({ text: '字幕 已关闭' });
+  nativeToastItem.style.opacity = '0';
+  const nativeToast = createElement();
+  nativeToast.descendants.push(nativeToastItem);
+  const context = setup({
+    selectors: {
+      '.bpx-player-video-area': [videoArea],
+      '.bpx-player-toast-wrap': [nativeToast]
+    }
+  });
+
+  context.api.showNotice('字幕已关闭');
+  assert.equal(context.infoDiv.style.opacity, '1');
+  assert.equal(context.timers[1].delay, 100);
+
+  nativeToastItem.style.opacity = '1';
+  context.timers[1].callback();
+
+  assert.equal(context.infoDiv.style.opacity, '0');
+  assert.equal(context.timers[0].cancelled, true);
+  assert.equal(context.observers[0].disconnected, true);
+});
+
+test('native subtitle language-switch toast counts as an enabled notice', () => {
+  const nativeToastItem = createElement({ text: '字幕已切换至 中文' });
+  const nativeToast = createElement();
+  nativeToast.descendants.push(nativeToastItem);
+  const context = setup({
+    selectors: { '.bpx-player-toast-wrap': [nativeToast] }
+  });
+
+  assert.equal(context.api.hasMatchingNativeNotice('字幕已开启'), true);
+});
+
+test('hidden stale native toast does not suppress a new script notice', () => {
+  const videoArea = createElement();
+  const nativeToastItem = createElement({ text: '字幕 已关闭' });
+  nativeToastItem.style.opacity = '0';
+  const nativeToast = createElement();
+  nativeToast.descendants.push(nativeToastItem);
+  const context = setup({
+    selectors: {
+      '.bpx-player-video-area': [videoArea],
+      '.bpx-player-toast-wrap': [nativeToast]
+    }
+  });
+
+  context.api.showNotice('字幕已关闭');
+
+  assert.equal(context.infoDiv.parentNode, videoArea);
+  assert.equal(context.infoDiv.style.opacity, '1');
+});
+
+test('native toast inside a transparent parent does not suppress a script notice', () => {
+  const videoArea = createElement();
+  const nativeToastItem = createElement({ text: '字幕 已关闭' });
+  const nativeToast = createElement();
+  nativeToast.style.opacity = '0';
+  nativeToast.descendants.push(nativeToastItem);
+  nativeToastItem.parentNode = nativeToast;
+  const context = setup({
+    selectors: {
+      '.bpx-player-video-area': [videoArea],
+      '.bpx-player-toast-wrap': [nativeToast]
+    }
+  });
+
+  context.api.showNotice('字幕已关闭');
+
+  assert.equal(nativeToastItem.getClientRects().length, 1);
+  assert.equal(context.infoDiv.parentNode, videoArea);
+  assert.equal(context.infoDiv.style.opacity, '1');
+});
